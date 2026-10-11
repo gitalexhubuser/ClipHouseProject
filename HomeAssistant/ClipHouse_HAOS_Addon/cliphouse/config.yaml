@@ -1,6 +1,6 @@
 name: "ClipHouse — общий буфер"
 slug: "cliphouse"
-version: "4.1.1"
+version: "4.2.0"
 description: >-
   Локальный общий текстовый буфер с SQLite-историей,
   избранным и синхронизацией между устройствами в домашней сети.
@@ -11,7 +11,7 @@ startup: application
 boot: auto
 init: false
 host_network: true
-webui: "http://[HOST]:8787/"
+webui: "http://[HOST]:[PORT:8787]/"
 options:
   max_text_chars: 100000
 schema:
