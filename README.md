@@ -10,5 +10,11 @@
 
 В закладки добавляем `http://homeassistant.local:8787/`
 
+## Установка
+
+- сложная
+
+Ложим сюда `\\HOMEASSISTANT\local_apps\cliphouse`
+
 # Repo
 https://github.com/gitalexhubuser/ClipHouseProject
