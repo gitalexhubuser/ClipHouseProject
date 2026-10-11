@@ -1,4 +1,4 @@
-# 🏰 ClipHouse — личная крепость буфера обмена
+# 🏰 ClipHouse —  локальный общий буфер обмена через браузер
 
 ![ClipHouse — главный экран](image-6.png)
 ![ClipHouse — история и избранное](image-7.png)
@@ -129,5 +129,3 @@ ClipHouse должен появиться среди локальных прил
 **[GitHub — ClipHouseProject](https://github.com/gitalexhubuser/ClipHouseProject)**
 
 ---
-
-*ClipHouse — локальный общий буфер обмена через браузер.*
