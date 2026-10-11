@@ -2,9 +2,11 @@
 # ClipHouse - a tiny LAN clipboard and text history for Windows.
 # Python standard library only. Designed for trusted home networks.
 
+import configparser
 import ctypes
 import json
 import os
+import re
 import socket
 import sys
 import threading
@@ -16,19 +18,102 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 APP_NAME = "ClipHouse"
-HTTP_PORT = 8787
-DISCOVERY_PORT = 8788
-MAX_TEXT_CHARS = 100_000
-MAX_HISTORY = 60
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(BASE_DIR, "config.ini")
+APP_STATE_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), APP_NAME)
+NODE_PATH = os.path.join(APP_STATE_DIR, "node-id.txt")
 MAX_REQUEST_BYTES = 2 * 1024 * 1024
 POLL_SECONDS = 2.5
 PEER_TIMEOUT = 25.0
-
-DATA_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), APP_NAME)
-HISTORY_PATH = os.path.join(DATA_DIR, "history.json")
-NODE_PATH = os.path.join(DATA_DIR, "node-id.txt")
 HOST_NAME = socket.gethostname()
 NODE_ID = ""
+
+
+def _write_default_config():
+    cfg = configparser.ConfigParser(interpolation=None)
+    cfg["server"] = {
+        "http_port": "8787",
+        "discovery_port": "8788",
+    }
+    default_history = r"%LOCALAPPDATA%\ClipHouse" if os.name == "nt" else APP_STATE_DIR
+    cfg["storage"] = {
+        "history_dir": default_history,
+        "max_history": "60",
+    }
+    cfg["clipboard"] = {
+        "auto_capture": "true",
+        "max_text_chars": "100000",
+    }
+    with open(CONFIG_PATH, "w", encoding="utf-8-sig", newline="") as f:
+        cfg.write(f)
+
+
+def _expand_path(raw_value, fallback):
+    raw_value = (raw_value or "").strip().strip('"')
+    if not raw_value:
+        return fallback
+    # Support Windows %VARIABLE% and Unix $VARIABLE notation without dependencies.
+    expanded = os.path.expandvars(os.path.expanduser(raw_value))
+    def replace_percent(match):
+        return os.environ.get(match.group(1), match.group(0))
+    expanded = re.sub(r"%([A-Za-z_][A-Za-z0-9_]*)%", replace_percent, expanded)
+    if re.search(r"%[A-Za-z_][A-Za-z0-9_]*%", expanded):
+        print("[ClipHouse] Не удалось раскрыть переменную в history_dir; использую путь по умолчанию.")
+        return fallback
+    if not os.path.isabs(expanded):
+        expanded = os.path.join(BASE_DIR, expanded)
+    return os.path.abspath(expanded)
+
+
+def _read_config():
+    if not os.path.isfile(CONFIG_PATH):
+        try:
+            _write_default_config()
+            print("[ClipHouse] Создан файл настроек: %s" % CONFIG_PATH)
+        except OSError as exc:
+            print("[ClipHouse] Не удалось создать config.ini: %s" % exc)
+
+    cfg = configparser.ConfigParser(interpolation=None)
+    try:
+        cfg.read(CONFIG_PATH, encoding="utf-8-sig")
+    except (OSError, configparser.Error) as exc:
+        print("[ClipHouse] Ошибка config.ini, используются настройки по умолчанию: %s" % exc)
+
+    def get_int(section, key, default, low, high):
+        try:
+            value = cfg.getint(section, key, fallback=default)
+        except (ValueError, configparser.Error):
+            value = default
+        return max(low, min(high, value))
+
+    def get_bool(section, key, default):
+        try:
+            return cfg.getboolean(section, key, fallback=default)
+        except (ValueError, configparser.Error):
+            return default
+
+    default_data_dir = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), APP_NAME)
+    raw_history_dir = cfg.get("storage", "history_dir", fallback=default_data_dir)
+    history_dir = _expand_path(raw_history_dir, default_data_dir)
+    settings = {
+        "http_port": get_int("server", "http_port", 8787, 1, 65535),
+        "discovery_port": get_int("server", "discovery_port", 8788, 1, 65535),
+        "history_dir": history_dir,
+        "max_history": get_int("storage", "max_history", 60, 1, 500),
+        "auto_capture": get_bool("clipboard", "auto_capture", True),
+        "max_text_chars": get_int("clipboard", "max_text_chars", 100000, 1, 1000000),
+    }
+    return settings
+
+
+_SETTINGS = _read_config()
+HTTP_PORT = _SETTINGS["http_port"]
+DISCOVERY_PORT = _SETTINGS["discovery_port"]
+DATA_DIR = _SETTINGS["history_dir"]
+HISTORY_PATH = os.path.join(DATA_DIR, "history.json")
+MAX_HISTORY = _SETTINGS["max_history"]
+AUTO_CAPTURE_CLIPBOARD = _SETTINGS["auto_capture"]
+MAX_TEXT_CHARS = _SETTINGS["max_text_chars"]
 
 _state_lock = threading.RLock()
 _clip_lock = threading.Lock()
@@ -43,8 +128,13 @@ def _ensure_data_dir():
     os.makedirs(DATA_DIR, exist_ok=True)
 
 
+def _ensure_state_dir():
+    os.makedirs(APP_STATE_DIR, exist_ok=True)
+
+
 def _load_node_id():
-    _ensure_data_dir()
+    # Keep the node identity independent from the configurable history location.
+    _ensure_state_dir()
     try:
         with open(NODE_PATH, "r", encoding="utf-8") as f:
             value = f.read().strip()
@@ -105,8 +195,16 @@ def _save_events_locked():
 
 
 def _load_events():
-    global _events
-    _ensure_data_dir()
+    global _events, DATA_DIR, HISTORY_PATH
+    try:
+        _ensure_data_dir()
+    except OSError as exc:
+        fallback_dir = os.path.join(APP_STATE_DIR, "History")
+        print("[ClipHouse] Не удалось создать папку истории (%s): %s" % (DATA_DIR, exc))
+        print("[ClipHouse] Переключаюсь на запасной путь: %s" % fallback_dir)
+        DATA_DIR = fallback_dir
+        HISTORY_PATH = os.path.join(DATA_DIR, "history.json")
+        _ensure_data_dir()
     try:
         with open(HISTORY_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -463,7 +561,7 @@ button{font:inherit;cursor:pointer;border:1px solid #465063;background:#252b36;c
 <section class="panel"><label for="newtext">Добавить текст в общий буфер</label><textarea id="newtext" placeholder="Вставь или напиши текст здесь…" maxlength="100000"></textarea><div class="actions"><button class="primary" id="publish">Добавить в общий буфер</button><button id="clearbox">Очистить поле</button></div><div class="hint">Текст попадёт в историю и разойдётся на остальные запущенные компьютеры. Максимум 100 000 символов.</div></section>
 <section class="panel"><div style="font-weight:700;margin-bottom:8px">Последний общий текст <button class="copy top-copy" id="copylatest" style="display:none">Копировать</button></div><pre id="latest" class="entry-text">Пока история пуста.</pre></section>
 <section class="panel"><details id="historyDetails"><summary class="history-head"><span>История буфера</span></summary><div id="history"><div class="empty">Пока пусто.</div></div></details></section>
-<div class="foot">Работает в домашней сети. На Windows программа автоматически замечает текст, который ты копируешь в других приложениях. На телефоне можно добавить текст вручную или скопировать его кнопкой. Не открывай этот порт в интернет на роутере.</div>
+<div class="foot">Работает в домашней сети. Если в config.ini включено auto_capture=true, Windows-программа автоматически сохраняет скопированный текст; при false добавляй текст вручную. На телефоне можно добавить текст или скопировать его кнопкой. Не открывай этот порт в интернет на роутере.</div>
 </main><div class="toast" id="toast"></div>
 <script>
 const $=id=>document.getElementById(id);let knownTop='';let isMobile=/Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent)||(navigator.maxTouchPoints>1&&/Macintosh/i.test(navigator.userAgent));
@@ -595,8 +693,9 @@ def main():
         threading.Thread(target=_discovery_receiver, name="ClipHouse-Discovery-RX", daemon=True),
         threading.Thread(target=_discovery_sender, name="ClipHouse-Discovery-TX", daemon=True),
         threading.Thread(target=_peer_sync_loop, name="ClipHouse-Sync", daemon=True),
-        threading.Thread(target=_clipboard_watcher, name="ClipHouse-Clipboard", daemon=True),
     ]
+    if AUTO_CAPTURE_CLIPBOARD:
+        threads.append(threading.Thread(target=_clipboard_watcher, name="ClipHouse-Clipboard", daemon=True))
     for thread in threads:
         thread.start()
 
@@ -605,9 +704,13 @@ def main():
     print("ClipHouse запущен на компьютере: %s" % HOST_NAME)
     print("Открой на этом ПК: http://127.0.0.1:%s/" % HTTP_PORT)
     print("В локальной сети:  http://%s:%s/" % (ip, HTTP_PORT))
-    print("Папка истории:     %s" % DATA_DIR)
+    print("Файл истории:      %s" % HISTORY_PATH)
+    print("Автозахват буфера: %s" % ("ВКЛ" if AUTO_CAPTURE_CLIPBOARD else "ВЫКЛ (добавление через сайт)"))
+    print("Лимит истории:     %s записей на узел" % MAX_HISTORY)
     print("Автообнаружение узлов: UDP %s; синхронизация истории: включена" % DISCOVERY_PORT)
-    print("Оставь это окно запущенным. Для выхода нажми Ctrl+C.")
+    print("Настройки:         %s" % CONFIG_PATH)
+    print("Оставь это окно запущенным. Ctrl+C в ЭТОМ окне останавливает сервер;")
+    print("в других программах Ctrl+C продолжает обычное копирование.")
     print("Не открывай порты ClipHouse в интернет на роутере.")
     print("=" * 58)
     try:
