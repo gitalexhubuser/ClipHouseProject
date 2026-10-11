@@ -11,7 +11,7 @@ startup: application
 boot: auto
 init: false
 host_network: true
-webui: "http://[HOST]:8787/"  ЭТО ВАЖНЫЙ ФИКС
+webui: "http://[HOST]:8787/"
 options:
   max_text_chars: 100000
 schema:
