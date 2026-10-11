@@ -18,8 +18,8 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 APP_NAME = "ClipHouse"
-APP_VERSION = 3
-APP_DISPLAY_VERSION = "3.0"
+APP_VERSION = 4
+APP_DISPLAY_VERSION = "4.0"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.ini")
 APP_STATE_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), APP_NAME)
@@ -174,7 +174,7 @@ def _clean_event(raw):
 
 
 def _event_from_row(row):
-    return {
+    result = {
         "id": row["id"],
         "ts": int(row["ts"]),
         "text": row["text"],
@@ -182,6 +182,10 @@ def _event_from_row(row):
         "node": row["node"],
         "source": row["source"],
     }
+    # History queries include a left-joined favorite state; sync/latest queries may not.
+    if "favorite" in row.keys():
+        result["favorite"] = bool(row["favorite"])
+    return result
 
 
 def _initialize_database():
@@ -221,16 +225,40 @@ def _initialize_database():
             node TEXT NOT NULL DEFAULT ''
         )""")
         _db.execute("CREATE INDEX IF NOT EXISTS idx_deletions_time ON deletions(deleted_ts DESC, seq DESC)")
+        # Favorite state is kept separately from clipboard text. The event log lets
+        # every node forward star/unstar changes to its other peers.
+        _db.execute("""CREATE TABLE IF NOT EXISTS favorite_state (
+            entry_id TEXT PRIMARY KEY,
+            is_favorite INTEGER NOT NULL,
+            changed_ts INTEGER NOT NULL,
+            device TEXT NOT NULL DEFAULT 'Компьютер',
+            node TEXT NOT NULL DEFAULT '',
+            event_id TEXT NOT NULL
+        )""")
+        _db.execute("""CREATE TABLE IF NOT EXISTS favorite_events (
+            seq INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id TEXT NOT NULL UNIQUE,
+            entry_id TEXT NOT NULL,
+            is_favorite INTEGER NOT NULL,
+            changed_ts INTEGER NOT NULL,
+            device TEXT NOT NULL DEFAULT 'Компьютер',
+            node TEXT NOT NULL DEFAULT ''
+        )""")
+        _db.execute("CREATE INDEX IF NOT EXISTS idx_favorite_events_entry ON favorite_events(entry_id, seq)")
+        _db.execute("CREATE INDEX IF NOT EXISTS idx_favorite_state_flag ON favorite_state(is_favorite, changed_ts DESC)")
         _db.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         _db.execute("""CREATE TABLE IF NOT EXISTS sync_cursors (
             peer_id TEXT PRIMARY KEY,
             last_seq INTEGER NOT NULL DEFAULT 0,
-            last_delete_seq INTEGER NOT NULL DEFAULT 0
+            last_delete_seq INTEGER NOT NULL DEFAULT 0,
+            last_favorite_seq INTEGER NOT NULL DEFAULT 0
         )""")
         # Upgrade databases created by ClipHouse 2.0 without discarding cursors.
         cursor_columns = {row[1] for row in _db.execute("PRAGMA table_info(sync_cursors)").fetchall()}
         if "last_delete_seq" not in cursor_columns:
             _db.execute("ALTER TABLE sync_cursors ADD COLUMN last_delete_seq INTEGER NOT NULL DEFAULT 0")
+        if "last_favorite_seq" not in cursor_columns:
+            _db.execute("ALTER TABLE sync_cursors ADD COLUMN last_favorite_seq INTEGER NOT NULL DEFAULT 0")
         # Cache the row count so the home page does not scan a giant history table
         # every 2.5 seconds just to display the count.
         has_count = _db.execute("SELECT 1 FROM meta WHERE key='entries_count'").fetchone()
@@ -359,6 +387,7 @@ def _merge_deletions(incoming):
             changed += max(0, cur.rowcount)
             # Remove even if the tombstone already existed; this also repairs a stale reinsert.
             _db.execute("DELETE FROM entries WHERE id=?", (deletion["id"],))
+            _db.execute("DELETE FROM favorite_state WHERE entry_id=?", (deletion["id"],))
     if changed:
         print("[ClipHouse] Получено удалений от другого узла: %s" % changed)
     return changed
@@ -389,7 +418,108 @@ def _delete_events(ids):
             new_tombstones += max(0, cur.rowcount)
             cur = _db.execute("DELETE FROM entries WHERE id=?", (ident,))
             deleted_entries += max(0, cur.rowcount)
+            _db.execute("DELETE FROM favorite_state WHERE entry_id=?", (ident,))
     return {"deleted": deleted_entries, "tombstones": new_tombstones}
+
+
+def _set_favorite(entry_id, is_favorite):
+    """Set favorite state locally and append a sync event. Returns new state."""
+    if not isinstance(entry_id, str) or not entry_id or len(entry_id) > 100:
+        raise ValueError("Некорректный ID записи")
+    if not isinstance(is_favorite, bool):
+        raise ValueError("is_favorite должен быть true или false")
+    event_id = str(uuid.uuid4())
+    with _db_lock, _db:
+        if _db.execute("SELECT 1 FROM entries WHERE id=?", (entry_id,)).fetchone() is None:
+            raise ValueError("Запись уже удалена или не найдена")
+        if _db.execute("SELECT 1 FROM deletions WHERE id=?", (entry_id,)).fetchone():
+            raise ValueError("Запись уже удалена")
+        current = _db.execute("SELECT changed_ts FROM favorite_state WHERE entry_id=?", (entry_id,)).fetchone()
+        # Ensure an explicit local click wins even if another node's clock is ahead
+        # by a small amount; the change timestamp remains monotonic per entry.
+        changed_ts = max(int(time.time() * 1000), (int(current[0]) + 1) if current else 0)
+        event = {
+            "event_id": event_id,
+            "entry_id": entry_id,
+            "is_favorite": 1 if is_favorite else 0,
+            "changed_ts": changed_ts,
+            "device": HOST_NAME[:100],
+            "node": NODE_ID,
+        }
+        _db.execute(
+            "INSERT INTO favorite_events(event_id,entry_id,is_favorite,changed_ts,device,node) VALUES(?,?,?,?,?,?)",
+            (event_id, entry_id, event["is_favorite"], changed_ts, event["device"], event["node"]),
+        )
+        _db.execute(
+            "INSERT INTO favorite_state(entry_id,is_favorite,changed_ts,device,node,event_id) VALUES(?,?,?,?,?,?) "
+            "ON CONFLICT(entry_id) DO UPDATE SET is_favorite=excluded.is_favorite,changed_ts=excluded.changed_ts, "
+            "device=excluded.device,node=excluded.node,event_id=excluded.event_id",
+            (entry_id, event["is_favorite"], changed_ts, event["device"], event["node"], event_id),
+        )
+    return {"id": entry_id, "favorite": is_favorite, "changed_ts": changed_ts}
+
+
+def _clean_favorite_event(raw):
+    if not isinstance(raw, dict):
+        return None
+    event_id = raw.get("event_id")
+    entry_id = raw.get("entry_id", raw.get("id"))
+    try:
+        changed_ts = int(raw.get("changed_ts", 0))
+        is_favorite = int(raw.get("is_favorite"))
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(event_id, str) or not event_id or len(event_id) > 100:
+        return None
+    if not isinstance(entry_id, str) or not entry_id or len(entry_id) > 100:
+        return None
+    if changed_ts <= 0 or is_favorite not in (0, 1):
+        return None
+    return {
+        "event_id": event_id,
+        "entry_id": entry_id,
+        "is_favorite": is_favorite,
+        "changed_ts": changed_ts,
+        "device": str(raw.get("device", "Компьютер"))[:100],
+        "node": str(raw.get("node", ""))[:100],
+    }
+
+
+def _merge_favorite_events(incoming):
+    """Merge and relay star/unstar events with deterministic last-write-wins state."""
+    if not isinstance(incoming, list):
+        return 0
+    changed = 0
+    with _db_lock, _db:
+        for raw in incoming:
+            event = _clean_favorite_event(raw)
+            if not event:
+                continue
+            cur = _db.execute(
+                "INSERT OR IGNORE INTO favorite_events(event_id,entry_id,is_favorite,changed_ts,device,node) VALUES(?,?,?,?,?,?)",
+                (event["event_id"], event["entry_id"], event["is_favorite"], event["changed_ts"], event["device"], event["node"]),
+            )
+            if not cur.rowcount:
+                continue
+            # A deletion tombstone always wins over any star-state event.
+            if _db.execute("SELECT 1 FROM deletions WHERE id=?", (event["entry_id"],)).fetchone():
+                continue
+            current = _db.execute(
+                "SELECT changed_ts,node,event_id FROM favorite_state WHERE entry_id=?", (event["entry_id"],)
+            ).fetchone()
+            incoming_key = (event["changed_ts"], event["node"], event["event_id"])
+            current_key = (int(current["changed_ts"]), current["node"], current["event_id"]) if current else None
+            if current_key is None or incoming_key > current_key:
+                _db.execute(
+                    "INSERT INTO favorite_state(entry_id,is_favorite,changed_ts,device,node,event_id) VALUES(?,?,?,?,?,?) "
+                    "ON CONFLICT(entry_id) DO UPDATE SET is_favorite=excluded.is_favorite,changed_ts=excluded.changed_ts, "
+                    "device=excluded.device,node=excluded.node,event_id=excluded.event_id",
+                    (event["entry_id"], event["is_favorite"], event["changed_ts"], event["device"], event["node"], event["event_id"]),
+                )
+                changed += 1
+    if changed:
+        print("[ClipHouse] Получено изменений избранного: %s" % changed)
+    return changed
 
 
 def _add_event(text, set_clipboard=False, source="local"):
@@ -458,7 +588,9 @@ def _history_page(page=1, query=""):
         if not query:
             total = _entry_count_locked()
             rows = _db.execute(
-                "SELECT seq,id,ts,text,device,node,source FROM entries ORDER BY ts DESC, seq DESC LIMIT ? OFFSET ?",
+                "SELECT e.seq,e.id,e.ts,e.text,e.device,e.node,e.source,COALESCE(fs.is_favorite,0) AS favorite "
+                "FROM entries e LEFT JOIN favorite_state fs ON fs.entry_id=e.id AND fs.is_favorite=1 "
+                "ORDER BY e.ts DESC,e.seq DESC LIMIT ? OFFSET ?",
                 (PAGE_SIZE, offset),
             ).fetchall()
         elif _FTS_ENABLED:
@@ -467,31 +599,55 @@ def _history_page(page=1, query=""):
             try:
                 total = int(_db.execute("SELECT COUNT(*) FROM entries_fts WHERE entries_fts MATCH ?", (fts_query,)).fetchone()[0])
                 rows = _db.execute(
-                    "SELECT e.seq,e.id,e.ts,e.text,e.device,e.node,e.source FROM entries e "
-                    "JOIN entries_fts f ON f.rowid=e.seq WHERE entries_fts MATCH ? "
-                    "ORDER BY e.ts DESC,e.seq DESC LIMIT ? OFFSET ?",
+                    "SELECT e.seq,e.id,e.ts,e.text,e.device,e.node,e.source,COALESCE(fs.is_favorite,0) AS favorite "
+                    "FROM entries e JOIN entries_fts f ON f.rowid=e.seq "
+                    "LEFT JOIN favorite_state fs ON fs.entry_id=e.id AND fs.is_favorite=1 "
+                    "WHERE entries_fts MATCH ? ORDER BY e.ts DESC,e.seq DESC LIMIT ? OFFSET ?",
                     (fts_query, PAGE_SIZE, offset),
                 ).fetchall()
             except sqlite3.OperationalError:
                 like = "%" + query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
                 total = int(_db.execute("SELECT COUNT(*) FROM entries WHERE text LIKE ? ESCAPE '\\' COLLATE NOCASE", (like,)).fetchone()[0])
                 rows = _db.execute(
-                    "SELECT seq,id,ts,text,device,node,source FROM entries WHERE text LIKE ? ESCAPE '\\' COLLATE NOCASE "
-                    "ORDER BY ts DESC,seq DESC LIMIT ? OFFSET ?",
+                    "SELECT e.seq,e.id,e.ts,e.text,e.device,e.node,e.source,COALESCE(fs.is_favorite,0) AS favorite "
+                    "FROM entries e LEFT JOIN favorite_state fs ON fs.entry_id=e.id AND fs.is_favorite=1 "
+                    "WHERE e.text LIKE ? ESCAPE '\\' COLLATE NOCASE ORDER BY e.ts DESC,e.seq DESC LIMIT ? OFFSET ?",
                     (like, PAGE_SIZE, offset),
                 ).fetchall()
         else:
             like = "%" + query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
             total = int(_db.execute("SELECT COUNT(*) FROM entries WHERE text LIKE ? ESCAPE '\\' COLLATE NOCASE", (like,)).fetchone()[0])
             rows = _db.execute(
-                "SELECT seq,id,ts,text,device,node,source FROM entries WHERE text LIKE ? ESCAPE '\\' COLLATE NOCASE "
-                "ORDER BY ts DESC,seq DESC LIMIT ? OFFSET ?",
+                "SELECT e.seq,e.id,e.ts,e.text,e.device,e.node,e.source,COALESCE(fs.is_favorite,0) AS favorite "
+                "FROM entries e LEFT JOIN favorite_state fs ON fs.entry_id=e.id AND fs.is_favorite=1 "
+                "WHERE e.text LIKE ? ESCAPE '\\' COLLATE NOCASE ORDER BY e.ts DESC,e.seq DESC LIMIT ? OFFSET ?",
                 (like, PAGE_SIZE, offset),
             ).fetchall()
     entries = [_event_from_row(row) for row in rows]
     pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
     return {"ok": True, "entries": entries, "page": page, "page_size": PAGE_SIZE, "total": total,
             "pages": pages, "has_prev": page > 1, "has_next": page < pages, "query": query}
+
+
+def _favorites_page(page=1):
+    page = max(1, int(page))
+    offset = (page - 1) * PAGE_SIZE
+    with _db_lock:
+        total = int(_db.execute(
+            "SELECT COUNT(*) FROM entries e JOIN favorite_state fs ON fs.entry_id=e.id AND fs.is_favorite=1 "
+            "LEFT JOIN deletions d ON d.id=e.id WHERE d.id IS NULL"
+        ).fetchone()[0])
+        rows = _db.execute(
+            "SELECT e.seq,e.id,e.ts,e.text,e.device,e.node,e.source,1 AS favorite "
+            "FROM entries e JOIN favorite_state fs ON fs.entry_id=e.id AND fs.is_favorite=1 "
+            "LEFT JOIN deletions d ON d.id=e.id WHERE d.id IS NULL "
+            "ORDER BY fs.changed_ts DESC,e.ts DESC,e.seq DESC LIMIT ? OFFSET ?",
+            (PAGE_SIZE, offset),
+        ).fetchall()
+    entries = [_event_from_row(row) for row in rows]
+    pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+    return {"ok": True, "entries": entries, "page": page, "page_size": PAGE_SIZE, "total": total,
+            "pages": pages, "has_prev": page > 1, "has_next": page < pages}
 
 
 def _get_sync_cursor(peer_id):
@@ -520,6 +676,19 @@ def _set_sync_delete_cursor(peer_id, last_seq):
                      (peer_id, int(last_seq)))
 
 
+def _get_sync_favorite_cursor(peer_id):
+    with _db_lock:
+        row = _db.execute("SELECT last_favorite_seq FROM sync_cursors WHERE peer_id=?", (peer_id,)).fetchone()
+        return int(row[0]) if row else 0
+
+
+def _set_sync_favorite_cursor(peer_id, last_seq):
+    with _db_lock, _db:
+        _db.execute("INSERT INTO sync_cursors(peer_id,last_seq,last_delete_seq,last_favorite_seq) VALUES(?,0,0,?) "
+                     "ON CONFLICT(peer_id) DO UPDATE SET last_favorite_seq=MAX(last_favorite_seq,excluded.last_favorite_seq)",
+                     (peer_id, int(last_seq)))
+
+
 def _get_sync_batch(after_seq):
     with _db_lock:
         rows = _db.execute(
@@ -545,6 +714,18 @@ def _get_delete_sync_batch(after_seq):
         result.append({"id": row["id"], "deleted_ts": int(row["deleted_ts"]),
                        "device": row["device"], "node": row["node"], "sync_seq": int(row["seq"])})
     return result
+
+
+def _get_favorite_sync_batch(after_seq):
+    with _db_lock:
+        rows = _db.execute(
+            "SELECT seq,event_id,entry_id,is_favorite,changed_ts,device,node FROM favorite_events "
+            "WHERE seq>? ORDER BY seq ASC LIMIT ?",
+            (int(after_seq), SYNC_BATCH_SIZE),
+        ).fetchall()
+    return [{"event_id": row["event_id"], "entry_id": row["entry_id"],
+             "is_favorite": int(row["is_favorite"]), "changed_ts": int(row["changed_ts"]),
+             "device": row["device"], "node": row["node"], "sync_seq": int(row["seq"])} for row in rows]
 
 
 # ---------- Native Windows clipboard (ctypes only; no pywin32 needed) ----------
@@ -750,8 +931,9 @@ def _peer_sync_loop():
             try:
                 cursor = _get_sync_cursor(peer_id)
                 delete_cursor = _get_sync_delete_cursor(peer_id)
-                url = peer["url"] + "/api/sync?after_seq=%s&after_delete_seq=%s" % (cursor, delete_cursor)
-                req = urllib.request.Request(url, headers={"User-Agent": "ClipHouse/3.0"})
+                favorite_cursor = _get_sync_favorite_cursor(peer_id)
+                url = peer["url"] + "/api/sync?after_seq=%s&after_delete_seq=%s&after_favorite_seq=%s" % (cursor, delete_cursor, favorite_cursor)
+                req = urllib.request.Request(url, headers={"User-Agent": "ClipHouse/4.0"})
                 with urllib.request.urlopen(req, timeout=3.0) as response:
                     payload = json.loads(response.read(32 * 1024 * 1024).decode("utf-8"))
                 if payload.get("node_id") == NODE_ID or int(payload.get("version", 0)) != APP_VERSION:
@@ -759,12 +941,16 @@ def _peer_sync_loop():
                 entries = payload.get("entries", [])
                 _merge_events(entries)
                 _merge_deletions(payload.get("deletions", []))
+                _merge_favorite_events(payload.get("favorites", []))
                 next_cursor = int(payload.get("next_cursor", cursor))
                 if next_cursor > cursor:
                     _set_sync_cursor(peer_id, next_cursor)
                 next_delete_cursor = int(payload.get("next_delete_cursor", delete_cursor))
                 if next_delete_cursor > delete_cursor:
                     _set_sync_delete_cursor(peer_id, next_delete_cursor)
+                next_favorite_cursor = int(payload.get("next_favorite_cursor", favorite_cursor))
+                if next_favorite_cursor > favorite_cursor:
+                    _set_sync_favorite_cursor(peer_id, next_favorite_cursor)
             except Exception:
                 # A peer may be sleeping, rebooting, or blocked by firewall.
                 pass
@@ -797,33 +983,41 @@ HTML_PAGE = r'''<!doctype html>
 <meta name="theme-color" content="#17191d"><title>ClipHouse — общий буфер</title>
 <style>
 :root{color-scheme:dark;--bg:#111317;--panel:#1b1e24;--line:#30343d;--muted:#a8afbc;--accent:#8ab4ff;--text:#f2f4f8}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}main{max-width:900px;margin:auto;padding:14px}.top{display:flex;align-items:center;justify-content:space-between;gap:14px;margin:5px 0 14px}.brand{font-weight:800;font-size:22px}.status{font-size:12px;text-align:right;color:var(--muted)}.panel{background:var(--panel);border:1px solid var(--line);border-radius:13px;padding:14px;margin:12px 0}label{display:block;font-weight:700;margin-bottom:8px}textarea,input{display:block;width:100%;background:#111317;color:var(--text);border:1px solid var(--line);border-radius:9px;padding:11px;font:inherit;outline:none}textarea{min-height:115px;resize:vertical}textarea:focus,input:focus{border-color:var(--accent)}button{background:#292e38;color:var(--text);border:1px solid #414754;border-radius:9px;padding:9px 12px;font:inherit;cursor:pointer}button:disabled{opacity:.5;cursor:default}.primary{background:#315f9e;border-color:#4c7dc0}.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:9px}.hint,.foot{font-size:12px;line-height:1.5;color:var(--muted);margin-top:9px}.latest-title{font-weight:700;margin-bottom:8px;display:flex;align-items:center;justify-content:space-between;gap:8px}.entry-text{white-space:pre-wrap;overflow-wrap:anywhere;background:#111317;border-radius:8px;padding:10px;max-height:240px;overflow:auto;font:14px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace;margin:0}.history-head{font-weight:700;cursor:pointer;display:flex;align-items:center;gap:8px;list-style:none}.history-head::-webkit-details-marker{display:none}.history-head:after{content:'＋';margin-left:auto;color:var(--muted)}details[open]>.history-head:after{content:'−'}.search-row{display:flex;gap:8px;margin-top:12px}.search-row input{flex:1;min-width:0}.history-info{display:flex;justify-content:space-between;align-items:center;gap:8px;color:var(--muted);font-size:12px;margin:9px 0}.entry{border-top:1px solid var(--line);padding:12px 0}.entry:first-child{border-top:0}.entry-meta{display:flex;align-items:center;gap:8px;justify-content:space-between;font-size:12px;color:var(--muted);margin-bottom:6px}.entry-actions{display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap;margin-top:7px}.delete-btn{border-color:#78464a;color:#ffc4c8}.empty{color:var(--muted);font-size:14px;padding:8px 0}.pager{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:10px}.toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);padding:10px 14px;border-radius:10px;background:#e4f2e8;color:#123821;box-shadow:0 8px 30px #0008;display:none;max-width:90vw;z-index:5}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}main{max-width:900px;margin:auto;padding:14px}.top{display:flex;align-items:center;justify-content:space-between;gap:14px;margin:5px 0 14px}.brand{font-weight:800;font-size:22px}.status{font-size:12px;text-align:right;color:var(--muted)}.panel{background:var(--panel);border:1px solid var(--line);border-radius:13px;padding:14px;margin:12px 0}label{display:block;font-weight:700;margin-bottom:8px}textarea,input{display:block;width:100%;background:#111317;color:var(--text);border:1px solid var(--line);border-radius:9px;padding:11px;font:inherit;outline:none}textarea{min-height:115px;resize:vertical}textarea:focus,input:focus{border-color:var(--accent)}button{background:#292e38;color:var(--text);border:1px solid #414754;border-radius:9px;padding:9px 12px;font:inherit;cursor:pointer}button:disabled{opacity:.5;cursor:default}.primary{background:#315f9e;border-color:#4c7dc0}.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:9px}.hint,.foot{font-size:12px;line-height:1.5;color:var(--muted);margin-top:9px}.latest-title{font-weight:700;margin-bottom:8px;display:flex;align-items:center;justify-content:space-between;gap:8px}.entry-text{white-space:pre-wrap;overflow-wrap:anywhere;background:#111317;border-radius:8px;padding:10px;max-height:240px;overflow:auto;font:14px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace;margin:0}.history-head{font-weight:700;cursor:pointer;display:flex;align-items:center;gap:8px;list-style:none}.history-head::-webkit-details-marker{display:none}.history-head:after{content:'＋';margin-left:auto;color:var(--muted)}details[open]>.history-head:after{content:'−'}.search-row{display:flex;gap:8px;margin-top:12px}.search-row input{flex:1;min-width:0}.history-info{display:flex;justify-content:space-between;align-items:center;gap:8px;color:var(--muted);font-size:12px;margin:9px 0}.entry{border-top:1px solid var(--line);padding:12px 0}.entry:first-child{border-top:0}.entry-meta{display:flex;align-items:center;gap:8px;justify-content:space-between;font-size:12px;color:var(--muted);margin-bottom:6px}.entry-actions{display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap;margin-top:7px}.delete-btn{border-color:#78464a;color:#ffc4c8}.empty{color:var(--muted);font-size:14px;padding:8px 0}.pager{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:10px}.toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);padding:10px 14px;border-radius:10px;background:#e4f2e8;color:#123821;box-shadow:0 8px 30px #0008;display:none;max-width:90vw;z-index:5}.star-toggle{min-width:42px;padding:3px 9px;font-size:24px;line-height:1;color:#737987;background:#22252b;border-color:#414650}.star-toggle.active{color:#ffd84d;text-shadow:0 0 10px #ffc92888;background:#332b15;border-color:#8b7027}.favorite-summary-star{color:#ffd84d;text-shadow:0 0 9px #ffc92877}.favorite-panel{border-color:#67552a}.favorite-entry{background:linear-gradient(90deg,#28231355,transparent 80%);padding-left:8px;padding-right:8px;border-radius:8px}.favorite-count{color:#ffd84d}
 @media(min-width:650px){main{padding-top:24px}.panel{padding:18px}textarea{min-height:130px}}
 </style></head><body><main>
 <div class="top"><div class="brand">📋 ClipHouse</div><div class="status" id="status">Подключение…</div></div>
 <section class="panel"><label for="newtext">Добавить текст в общий буфер</label><textarea id="newtext" placeholder="Вставь или напиши текст здесь…" maxlength="1000000"></textarea><div class="actions"><button class="primary" id="publish">Добавить в общий буфер</button><button id="clearbox">Очистить поле</button></div><div class="hint">Текст попадёт в общую историю. Большие архивы остаются в SQLite и не загружаются целиком в браузер.</div></section>
 <section class="panel"><div class="latest-title"><span>Последний общий текст</span><button class="copy" id="copylatest" style="display:none">Копировать</button></div><pre id="latest" class="entry-text">Пока история пуста.</pre></section>
+<section class="panel favorite-panel"><details id="favoritesDetails"><summary class="history-head"><span class="favorite-summary-star">★</span> Избранное <span class="favorite-count" id="favoriteCount"></span></summary><div class="history-info"><span>Закреплённые записи, сохраняются после перезапуска</span><span id="favoritePageLabel"></span></div><div id="favorites"><div class="empty">Открой избранное, чтобы загрузить записи.</div></div><div class="pager"><button id="prevFavorites" disabled>← Назад</button><button id="nextFavorites" disabled>Дальше →</button></div></details></section>
 <section class="panel"><details id="historyDetails"><summary class="history-head">История и поиск</summary><div class="search-row"><input id="search" type="search" placeholder="Поиск по тексту или фразе…"><button id="searchButton">Найти</button><button id="clearSearch">Сброс</button></div><div class="history-info"><span id="resultCount">История ещё не загружена</span><span id="pageLabel"></span></div><div id="history"><div class="empty">Открой историю, чтобы загрузить последние 50 записей.</div></div><div class="pager"><button id="prevPage" disabled>← Новее</button><button id="nextPage" disabled>Старее →</button></div></details></section>
 <div class="foot">ClipHouse работает в домашней сети. Автозахват буфера Windows включается в config.ini. Не открывай порт программы в интернет через роутер.</div>
 </main><div class="toast" id="toast"></div>
 <script>
-const $=id=>document.getElementById(id);let knownTop='';let currentPage=1;let currentQuery='';let pageCount=1;let historyLoaded=false;let requestToken=0;let isMobile=/Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent)||(navigator.maxTouchPoints>1&&/Macintosh/i.test(navigator.userAgent));
+const $=id=>document.getElementById(id);let knownTop='';let currentPage=1;let currentQuery='';let pageCount=1;let historyLoaded=false;let requestToken=0;let favoritesPage=1;let favoritesPages=1;let favoritesLoaded=false;let favoritesRequestToken=0;let isMobile=/Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent)||(navigator.maxTouchPoints>1&&/Macintosh/i.test(navigator.userAgent));
 function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function toast(msg){const t=$('toast');t.textContent=msg;t.style.display='block';clearTimeout(window._toastTimer);window._toastTimer=setTimeout(()=>t.style.display='none',1900)}
 async function postText(text){const r=await fetch('/api/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text})});const d=await r.json();if(!r.ok||!d.ok)throw new Error(d.error||'Не удалось отправить текст');return d}
 async function copyText(text){try{let copyPromise;if(navigator.clipboard&&navigator.clipboard.writeText){copyPromise=navigator.clipboard.writeText(text)}else{const x=document.createElement('textarea');x.value=text;x.style.position='fixed';x.style.opacity='0';document.body.appendChild(x);x.focus();x.select();const ok=document.execCommand('copy');x.remove();if(!ok)throw new Error('Браузер не разрешил копирование');copyPromise=Promise.resolve()}if(isMobile){await postText(text)}await copyPromise;toast('Скопировано')}catch(e){const x=document.createElement('textarea');x.value=text;x.style.position='fixed';x.style.opacity='1';x.style.left='10px';x.style.top='10px';document.body.appendChild(x);x.focus();x.select();toast('Текст выделен — скопируй его вручную')}}
-function renderHistory(data){
- const entries=data.entries||[];pageCount=data.pages||1;currentPage=data.page||1;
- $('resultCount').textContent='Записей: '+Number(data.total||0);
- $('pageLabel').textContent='Страница '+currentPage+' из '+pageCount;
- $('prevPage').disabled=!data.has_prev;$('nextPage').disabled=!data.has_next;
- const root=$('history');
- if(!entries.length){root.innerHTML='<div class="empty">Ничего не найдено.</div>';return}
+function renderEntries(data, rootId, favoritesMode=false){
+ const entries=data.entries||[];const root=$(rootId);
+ if(!entries.length){root.innerHTML='<div class="empty">'+(favoritesMode?'Пока нет избранных записей. Нажми ★ у нужного текста в истории.':'Ничего не найдено.')+'</div>';return}
  root.innerHTML=entries.map((e,i)=>{
   const dt=new Date(e.ts);const when=dt.toLocaleDateString()+' '+dt.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'});
-  return '<article class="entry"><div class="entry-meta"><span>'+esc(when)+' · '+esc(e.device||'Компьютер')+'</span><span>'+String(e.text.length)+' симв.</span></div><pre class="entry-text">'+esc(e.text)+'</pre><div class="entry-actions"><button class="copy" data-copy="'+i+'">Копировать</button><button class="delete-btn" data-delete="'+i+'">Удалить везде</button></div></article>'
+  const starred=!!e.favorite;
+  return '<article class="entry '+(starred?'favorite-entry':'')+'"><div class="entry-meta"><span>'+esc(when)+' · '+esc(e.device||'Компьютер')+'</span><span>'+String(e.text.length)+' симв.</span></div><pre class="entry-text">'+esc(e.text)+'</pre><div class="entry-actions"><button class="star-toggle '+(starred?'active':'')+'" data-favorite="'+i+'" title="'+(starred?'Убрать из избранного':'Добавить в избранное')+'" aria-label="'+(starred?'Убрать из избранного':'Добавить в избранное')+'">'+(starred?'★':'☆')+'</button><button class="copy" data-copy="'+i+'">Копировать</button><button class="delete-btn" data-delete="'+i+'">Удалить везде</button></div></article>'
  }).join('');
  root.querySelectorAll('[data-copy]').forEach(btn=>btn.addEventListener('click',()=>copyText(entries[Number(btn.dataset.copy)].text)));
+ root.querySelectorAll('[data-favorite]').forEach(btn=>btn.addEventListener('click',async()=>{
+  const entry=entries[Number(btn.dataset.favorite)];if(!entry)return;btn.disabled=true;
+  try{
+   const r=await fetch('/api/favorite',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:entry.id,favorite:!entry.favorite})});
+   const d=await r.json();if(!r.ok||!d.ok)throw new Error(d.error||'Ошибка изменения избранного');
+   toast(d.favorite?'Добавлено в избранное ★':'Убрано из избранного');
+   if(rootId==='history'||historyLoaded||$('historyDetails').open)await loadHistory(currentPage,currentQuery);
+   if(favoritesLoaded||$('favoritesDetails').open)await loadFavorites(favoritesPage);
+  }catch(err){toast(err.message);btn.disabled=false}
+ }));
  root.querySelectorAll('[data-delete]').forEach(btn=>btn.addEventListener('click',async()=>{
   const entry=entries[Number(btn.dataset.delete)];
   if(!entry||!confirm('Удалить эту запись на всех компьютерах ClipHouse? Удаление синхронизируется и запись не должна появиться снова.'))return;
@@ -832,23 +1026,39 @@ function renderHistory(data){
    const r=await fetch('/api/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ids:[entry.id]})});
    const d=await r.json();if(!r.ok||!d.ok)throw new Error(d.error||'Ошибка удаления');
    toast('Запись удалена; удаление отправлено другим компьютерам');
-   await loadState();await loadHistory(currentPage,currentQuery);
+   await loadState();await loadHistory(currentPage,currentQuery);if(favoritesLoaded||$('favoritesDetails').open)await loadFavorites(favoritesPage);
   }catch(err){toast('Не удалось удалить: '+err.message);btn.disabled=false}
  }));
 }
+function renderHistory(data){
+ pageCount=data.pages||1;currentPage=data.page||1;
+ $('resultCount').textContent='Записей: '+Number(data.total||0);
+ $('pageLabel').textContent='Страница '+currentPage+' из '+pageCount;
+ $('prevPage').disabled=!data.has_prev;$('nextPage').disabled=!data.has_next;
+ renderEntries(data,'history',false);
+}
+function renderFavorites(data){
+ favoritesPage=data.page||1;favoritesPages=data.pages||1;
+ $('favoriteCount').textContent='('+Number(data.total||0)+')';
+ $('favoritePageLabel').textContent='Страница '+favoritesPage+' из '+favoritesPages;
+ $('prevFavorites').disabled=!data.has_prev;$('nextFavorites').disabled=!data.has_next;
+ renderEntries(data,'favorites',true);favoritesLoaded=true;
+}
+async function loadFavorites(page=1){const token=++favoritesRequestToken;favoritesPage=page;try{const r=await fetch('/api/favorites?page='+page,{cache:'no-store'});const d=await r.json();if(token!==favoritesRequestToken)return;if(!r.ok||!d.ok)throw new Error(d.error||'Ошибка загрузки избранного');if(page>(d.pages||1))return loadFavorites(d.pages||1);renderFavorites(d)}catch(e){$('favorites').innerHTML='<div class="empty">Не удалось загрузить избранное: '+esc(e.message)+'</div>'}}
 async function loadHistory(page=1,query=currentQuery){const token=++requestToken;currentPage=page;currentQuery=query;const params=new URLSearchParams({page:String(page),q:query});try{const r=await fetch('/api/history?'+params.toString(),{cache:'no-store'});const d=await r.json();if(token!==requestToken)return;if(!r.ok||!d.ok)throw new Error(d.error||'Ошибка загрузки истории');renderHistory(d);historyLoaded=true}catch(e){$('history').innerHTML='<div class="empty">Не удалось загрузить историю: '+esc(e.message)+'</div>'}}
 async function loadState(){try{const r=await fetch('/api/state?now='+Date.now(),{cache:'no-store'});const d=await r.json();$('status').innerHTML=esc(d.host||'Этот компьютер')+'<br>Узлов в сети: '+Number(d.peer_count||0)+' · Записей: '+Number(d.total||0);if(d.latest){knownTop=d.latest.text;$('latest').textContent=d.latest.text;$('copylatest').style.display='inline-block'}else{$('latest').textContent='Пока история пуста.';$('copylatest').style.display='none'}if($('historyDetails').open&&historyLoaded&&!currentQuery&&currentPage===1)loadHistory(1,'')}catch(e){$('status').textContent='Нет связи с сервером'}}
 $('publish').addEventListener('click',async()=>{const text=$('newtext').value;if(!text.trim()){toast('Сначала введи текст');return}const b=$('publish');b.disabled=true;try{await postText(text);$('newtext').value='';toast('Добавлено в общий буфер');await loadState();if($('historyDetails').open)loadHistory(1,currentQuery)}catch(e){toast(e.message)}finally{b.disabled=false}});
 $('clearbox').addEventListener('click',()=>$('newtext').value='');$('copylatest').addEventListener('click',()=>copyText(knownTop));
-$('historyDetails').addEventListener('toggle',()=>{if($('historyDetails').open&&!historyLoaded)loadHistory(1,'')});
+$('historyDetails').addEventListener('toggle',()=>{if($('historyDetails').open)loadHistory(currentPage,currentQuery)});
 $('searchButton').addEventListener('click',()=>loadHistory(1,$('search').value.trim()));$('search').addEventListener('keydown',e=>{if(e.key==='Enter')loadHistory(1,$('search').value.trim())});$('clearSearch').addEventListener('click',()=>{$('search').value='';loadHistory(1,'')});
 $('prevPage').addEventListener('click',()=>{if(currentPage>1)loadHistory(currentPage-1,currentQuery)});$('nextPage').addEventListener('click',()=>{if(currentPage<pageCount)loadHistory(currentPage+1,currentQuery)});
-loadState();setInterval(loadState,2500);setInterval(()=>{if($('historyDetails').open&&historyLoaded&&!currentQuery&&currentPage===1)loadHistory(1,'')},8000);
+$('favoritesDetails').addEventListener('toggle',()=>{if($('favoritesDetails').open&&!favoritesLoaded)loadFavorites(1)});$('prevFavorites').addEventListener('click',()=>{if(favoritesPage>1)loadFavorites(favoritesPage-1)});$('nextFavorites').addEventListener('click',()=>{if(favoritesPage<favoritesPages)loadFavorites(favoritesPage+1)});
+loadState();setInterval(loadState,2500);setInterval(()=>{if($('historyDetails').open&&historyLoaded&&!currentQuery&&currentPage===1)loadHistory(1,'');if($('favoritesDetails').open&&favoritesLoaded)loadFavorites(favoritesPage)},8000);
 </script></body></html>'''
 
 
 class ClipHouseHandler(BaseHTTPRequestHandler):
-    server_version = "ClipHouse/3.0"
+    server_version = "ClipHouse/4.0"
 
     def log_message(self, fmt, *args):
         return
@@ -911,6 +1121,17 @@ class ClipHouseHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self._json(500, {"ok": False, "error": "Ошибка поиска: " + str(exc)[:180]})
             return
+        if parsed.path == "/api/favorites":
+            query = urllib.parse.parse_qs(parsed.query)
+            try:
+                page = int(query.get("page", ["1"])[0])
+            except (ValueError, TypeError):
+                page = 1
+            try:
+                self._json(200, _favorites_page(page))
+            except Exception as exc:
+                self._json(500, {"ok": False, "error": "Ошибка загрузки избранного: " + str(exc)[:180]})
+            return
         if parsed.path == "/api/sync":
             query = urllib.parse.parse_qs(parsed.query)
             try:
@@ -921,13 +1142,20 @@ class ClipHouseHandler(BaseHTTPRequestHandler):
                 after_delete_seq = max(0, int(query.get("after_delete_seq", ["0"])[0]))
             except (ValueError, TypeError):
                 after_delete_seq = 0
+            try:
+                after_favorite_seq = max(0, int(query.get("after_favorite_seq", ["0"])[0]))
+            except (ValueError, TypeError):
+                after_favorite_seq = 0
             entries = _get_sync_batch(after_seq)
             next_cursor = entries[-1]["sync_seq"] if entries else after_seq
             deletions = _get_delete_sync_batch(after_delete_seq)
             next_delete_cursor = deletions[-1]["sync_seq"] if deletions else after_delete_seq
+            favorites = _get_favorite_sync_batch(after_favorite_seq)
+            next_favorite_cursor = favorites[-1]["sync_seq"] if favorites else after_favorite_seq
             self._json(200, {"ok": True, "version": APP_VERSION, "node_id": NODE_ID,
                              "entries": entries, "next_cursor": next_cursor,
                              "deletions": deletions, "next_delete_cursor": next_delete_cursor,
+                             "favorites": favorites, "next_favorite_cursor": next_favorite_cursor,
                              "batch_size": SYNC_BATCH_SIZE})
             return
         if parsed.path == "/api/health":
@@ -937,7 +1165,7 @@ class ClipHouseHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
-        if parsed.path not in ("/api/add", "/api/delete"):
+        if parsed.path not in ("/api/add", "/api/delete", "/api/favorite"):
             self._json(404, {"ok": False, "error": "Не найдено"})
             return
         try:
@@ -946,6 +1174,10 @@ class ClipHouseHandler(BaseHTTPRequestHandler):
                 raise ValueError("Некорректные данные")
             if parsed.path == "/api/delete":
                 result = _delete_events(data.get("ids"))
+                self._json(200, {"ok": True, **result})
+                return
+            if parsed.path == "/api/favorite":
+                result = _set_favorite(data.get("id"), data.get("favorite"))
                 self._json(200, {"ok": True, **result})
                 return
             text = data.get("text")
@@ -1007,7 +1239,8 @@ def main():
     print("Короткое имя после настройки DNS на роутере: http://%s:%s/" % (LOCAL_NAME, HTTP_PORT))
     print("SQLite:             %s" % DATABASE_PATH)
     print("Автозахват буфера:  %s" % ("ВКЛ" if AUTO_CAPTURE_CLIPBOARD else "ВЫКЛ (текст добавляется через сайт)"))
-    print("История в браузере: по 50 записей на страницу; SQLite хранит архив")
+    print("История: по 50 записей на страницу; SQLite хранит архив")
+    print("Избранное: жёлтая звезда; изменения синхронизируются между узлами")
     print("Поиск:              %s" % ("FTS5 (полнотекстовый индекс)" if _FTS_ENABLED else "SQLite LIKE"))
     print("Автообнаружение:    UDP %s; синхронизация идёт партиями по %s записей" % (DISCOVERY_PORT, SYNC_BATCH_SIZE))
     print("Настройки:          %s" % CONFIG_PATH)
