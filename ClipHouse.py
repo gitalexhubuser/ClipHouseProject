@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # ClipHouse — local-network text clipboard with SQLite history.
 # Python standard library only; designed for trusted home networks.
 
@@ -18,13 +18,17 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 APP_NAME = "ClipHouse"
-APP_VERSION = 4
-APP_DISPLAY_VERSION = "4.0"
+APP_VERSION = 5
+APP_DISPLAY_VERSION = "4.1"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(BASE_DIR, "config.ini")
-APP_STATE_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), APP_NAME)
+# Optional paths let the same program run in a persistent Home Assistant app container.
+CONFIG_PATH = os.path.abspath(os.environ.get("CLIPHOUSE_CONFIG_PATH", os.path.join(BASE_DIR, "config.ini")))
+APP_STATE_DIR = os.path.abspath(os.environ.get(
+    "CLIPHOUSE_STATE_DIR",
+    os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), APP_NAME),
+))
 NODE_PATH = os.path.join(APP_STATE_DIR, "node-id.txt")
-MAX_REQUEST_BYTES = 5 * 1024 * 1024
+MAX_REQUEST_BYTES = 16 * 1024 * 1024
 PAGE_SIZE = 50
 SYNC_BATCH_SIZE = 25
 POLL_SECONDS = 2.5
@@ -36,7 +40,7 @@ NODE_ID = ""
 def _write_default_config():
     cfg = configparser.ConfigParser(interpolation=None)
     cfg["server"] = {"http_port": "8787", "discovery_port": "8788"}
-    default_history = r"%LOCALAPPDATA%\ClipHouse" if os.name == "nt" else APP_STATE_DIR
+    default_history = r"%LOCALAPPDATA%\ClipHouse" if os.name == "nt" and not os.environ.get("CLIPHOUSE_STATE_DIR") else APP_STATE_DIR
     cfg["storage"] = {"history_dir": default_history}
     cfg["clipboard"] = {"auto_capture": "true", "max_text_chars": "100000"}
     cfg["web"] = {"local_name": "clipboard"}
@@ -89,7 +93,7 @@ def _read_config():
         except (ValueError, configparser.Error):
             return default
 
-    default_data_dir = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), APP_NAME)
+    default_data_dir = APP_STATE_DIR
     raw_history_dir = cfg.get("storage", "history_dir", fallback=default_data_dir)
     history_dir = _expand_path(raw_history_dir, default_data_dir)
     local_name = cfg.get("web", "local_name", fallback="clipboard").strip().strip(".")
@@ -121,6 +125,7 @@ _db_lock = threading.RLock()
 _clip_lock = threading.Lock()
 _peers_lock = threading.RLock()
 _peers = {}  # node_id -> {url, name, ip, last_seen}
+_sync_error_log = {}  # node_id -> last monotonic timestamp when an error was printed
 _suppressed_clipboard = {}  # exact clipboard text -> monotonic expiry
 _http_server = None
 _FTS_ENABLED = False
@@ -251,14 +256,23 @@ def _initialize_database():
             peer_id TEXT PRIMARY KEY,
             last_seq INTEGER NOT NULL DEFAULT 0,
             last_delete_seq INTEGER NOT NULL DEFAULT 0,
-            last_favorite_seq INTEGER NOT NULL DEFAULT 0
+            last_favorite_seq INTEGER NOT NULL DEFAULT 0,
+            last_push_seq INTEGER NOT NULL DEFAULT 0,
+            last_push_delete_seq INTEGER NOT NULL DEFAULT 0,
+            last_push_favorite_seq INTEGER NOT NULL DEFAULT 0
         )""")
-        # Upgrade databases created by ClipHouse 2.0 without discarding cursors.
+        # Upgrade databases from older ClipHouse versions without discarding cursors.
         cursor_columns = {row[1] for row in _db.execute("PRAGMA table_info(sync_cursors)").fetchall()}
         if "last_delete_seq" not in cursor_columns:
             _db.execute("ALTER TABLE sync_cursors ADD COLUMN last_delete_seq INTEGER NOT NULL DEFAULT 0")
         if "last_favorite_seq" not in cursor_columns:
             _db.execute("ALTER TABLE sync_cursors ADD COLUMN last_favorite_seq INTEGER NOT NULL DEFAULT 0")
+        if "last_push_seq" not in cursor_columns:
+            _db.execute("ALTER TABLE sync_cursors ADD COLUMN last_push_seq INTEGER NOT NULL DEFAULT 0")
+        if "last_push_delete_seq" not in cursor_columns:
+            _db.execute("ALTER TABLE sync_cursors ADD COLUMN last_push_delete_seq INTEGER NOT NULL DEFAULT 0")
+        if "last_push_favorite_seq" not in cursor_columns:
+            _db.execute("ALTER TABLE sync_cursors ADD COLUMN last_push_favorite_seq INTEGER NOT NULL DEFAULT 0")
         # Cache the row count so the home page does not scan a giant history table
         # every 2.5 seconds just to display the count.
         has_count = _db.execute("SELECT 1 FROM meta WHERE key='entries_count'").fetchone()
@@ -689,6 +703,28 @@ def _set_sync_favorite_cursor(peer_id, last_seq):
                      (peer_id, int(last_seq)))
 
 
+def _get_push_cursor(peer_id, column):
+    allowed = {"last_push_seq", "last_push_delete_seq", "last_push_favorite_seq"}
+    if column not in allowed:
+        raise ValueError("Invalid push cursor")
+    with _db_lock:
+        row = _db.execute("SELECT %s FROM sync_cursors WHERE peer_id=?" % column, (peer_id,)).fetchone()
+        return int(row[0]) if row else 0
+
+
+def _set_push_cursor(peer_id, column, last_seq):
+    allowed = {"last_push_seq", "last_push_delete_seq", "last_push_favorite_seq"}
+    if column not in allowed:
+        raise ValueError("Invalid push cursor")
+    with _db_lock, _db:
+        _db.execute(
+            "INSERT INTO sync_cursors(peer_id,%s) VALUES(?,?) "
+            "ON CONFLICT(peer_id) DO UPDATE SET %s=MAX(%s,excluded.%s)" %
+            (column, column, column, column),
+            (peer_id, int(last_seq)),
+        )
+
+
 def _get_sync_batch(after_seq):
     with _db_lock:
         rows = _db.execute(
@@ -872,6 +908,31 @@ def _clipboard_watcher():
 
 
 # ---------- Peer discovery and incremental replication on LAN ----------
+def _register_peer(peer_id, ip, port, name):
+    """Remember a LAN peer learned from UDP discovery or an HTTP sync request.
+
+    Learning the caller during /api/sync makes discovery resilient when one PC's
+    Windows Firewall drops UDP broadcasts in only one direction.
+    """
+    try:
+        peer_id = str(peer_id or "").strip()[:100]
+        port = int(port)
+        ip = str(ip or "").strip()
+        name = str(name or "Другой компьютер")[:100]
+    except (TypeError, ValueError):
+        return False
+    if not peer_id or peer_id == NODE_ID or not ip or not (1 <= port <= 65535):
+        return False
+    # The IP address comes from recvfrom() or the TCP socket peer address, not from
+    # a value supplied by the remote request. Do not allow URL/path injection.
+    if any(ch not in "0123456789." for ch in ip):
+        return False
+    with _peers_lock:
+        _peers[peer_id] = {"url": "http://%s:%d" % (ip, port), "ip": ip,
+                           "name": name, "last_seen": time.monotonic()}
+    return True
+
+
 def _discovery_sender():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
@@ -905,11 +966,7 @@ def _discovery_receiver():
             port = int(info.get("port", HTTP_PORT))
             if not 1 <= port <= 65535:
                 continue
-            peer_id = str(info["id"])
-            with _peers_lock:
-                _peers[peer_id] = {"url": "http://%s:%d" % (addr[0], port), "ip": addr[0],
-                                   "name": str(info.get("name", "Другой компьютер"))[:100],
-                                   "last_seen": time.monotonic()}
+            _register_peer(info["id"], addr[0], port, info.get("name", "Другой компьютер"))
         except socket.timeout:
             pass
         except (ValueError, TypeError, OSError):
@@ -926,14 +983,25 @@ def _peer_sync_loop():
             expired = [pid for pid, peer in _peers.items() if now - peer["last_seen"] > PEER_TIMEOUT]
             for pid in expired:
                 _peers.pop(pid, None)
+                _sync_error_log.pop(pid, None)
             peers = [(pid, dict(peer)) for pid, peer in _peers.items()]
         for peer_id, peer in peers:
             try:
+                # PULL: retrieve changes published by this peer.
                 cursor = _get_sync_cursor(peer_id)
                 delete_cursor = _get_sync_delete_cursor(peer_id)
                 favorite_cursor = _get_sync_favorite_cursor(peer_id)
-                url = peer["url"] + "/api/sync?after_seq=%s&after_delete_seq=%s&after_favorite_seq=%s" % (cursor, delete_cursor, favorite_cursor)
-                req = urllib.request.Request(url, headers={"User-Agent": "ClipHouse/4.0"})
+                sync_query = urllib.parse.urlencode({
+                    "after_seq": cursor,
+                    "after_delete_seq": delete_cursor,
+                    "after_favorite_seq": favorite_cursor,
+                    "from_id": NODE_ID,
+                    "from_name": HOST_NAME,
+                    "from_port": HTTP_PORT,
+                    "from_version": APP_VERSION,
+                })
+                url = peer["url"] + "/api/sync?" + sync_query
+                req = urllib.request.Request(url, headers={"User-Agent": "ClipHouse/4.1"})
                 with urllib.request.urlopen(req, timeout=3.0) as response:
                     payload = json.loads(response.read(32 * 1024 * 1024).decode("utf-8"))
                 if payload.get("node_id") == NODE_ID or int(payload.get("version", 0)) != APP_VERSION:
@@ -951,9 +1019,50 @@ def _peer_sync_loop():
                 next_favorite_cursor = int(payload.get("next_favorite_cursor", favorite_cursor))
                 if next_favorite_cursor > favorite_cursor:
                     _set_sync_favorite_cursor(peer_id, next_favorite_cursor)
-            except Exception:
-                # A peer may be sleeping, rebooting, or blocked by firewall.
-                pass
+
+                # PUSH: send our own/unseen changes to the peer too. This is important
+                # when UDP discovery is asymmetric: A can see B and connect to B, while
+                # B may not receive A's UDP broadcast. A can still send changes to B over
+                # the same working HTTP connection direction.
+                push_cursor = _get_push_cursor(peer_id, "last_push_seq")
+                push_delete_cursor = _get_push_cursor(peer_id, "last_push_delete_seq")
+                push_favorite_cursor = _get_push_cursor(peer_id, "last_push_favorite_seq")
+                push_entries = _get_sync_batch(push_cursor)
+                push_deletions = _get_delete_sync_batch(push_delete_cursor)
+                push_favorites = _get_favorite_sync_batch(push_favorite_cursor)
+                if push_entries or push_deletions or push_favorites:
+                    push_payload = {
+                        "version": APP_VERSION,
+                        "node_id": NODE_ID,
+                        "entries": push_entries,
+                        "deletions": push_deletions,
+                        "favorites": push_favorites,
+                    }
+                    push_body = json.dumps(push_payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                    push_req = urllib.request.Request(
+                        peer["url"] + "/api/replicate", data=push_body,
+                        headers={"Content-Type": "application/json", "User-Agent": "ClipHouse/4.1"},
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(push_req, timeout=3.0) as response:
+                        push_result = json.loads(response.read(1024 * 1024).decode("utf-8"))
+                    if not push_result.get("ok"):
+                        raise RuntimeError(str(push_result.get("error", "peer rejected replication")))
+                    if push_entries:
+                        _set_push_cursor(peer_id, "last_push_seq", push_entries[-1]["sync_seq"])
+                    if push_deletions:
+                        _set_push_cursor(peer_id, "last_push_delete_seq", push_deletions[-1]["sync_seq"])
+                    if push_favorites:
+                        _set_push_cursor(peer_id, "last_push_favorite_seq", push_favorites[-1]["sync_seq"])
+                _sync_error_log.pop(peer_id, None)
+            except Exception as exc:
+                # A peer may be sleeping, rebooting, or blocked by firewall. Log
+                # occasionally so one-way connectivity can be diagnosed without flooding.
+                last_log = _sync_error_log.get(peer_id, 0.0)
+                if time.monotonic() - last_log >= 15.0:
+                    print("[ClipHouse] Синхронизация с %s (%s) не удалась: %s" %
+                          (peer.get("name", peer_id), peer.get("ip", "?"), str(exc)[:180]))
+                    _sync_error_log[peer_id] = time.monotonic()
 
 
 def _get_lan_ip():
@@ -1134,6 +1243,18 @@ class ClipHouseHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/sync":
             query = urllib.parse.parse_qs(parsed.query)
+            # A successful sync request is also a reliable way to learn the caller.
+            # It repairs asymmetric UDP discovery: if A sees B but B misses A's
+            # broadcast, B learns A from this HTTP request and begins pulling back.
+            try:
+                caller_version = int(query.get("from_version", ["0"])[0])
+                caller_id = query.get("from_id", [""])[0]
+                caller_name = query.get("from_name", ["Другой компьютер"])[0]
+                caller_port = int(query.get("from_port", [str(HTTP_PORT)])[0])
+                if caller_version == APP_VERSION and caller_id:
+                    _register_peer(caller_id, self.client_address[0], caller_port, caller_name)
+            except (ValueError, TypeError, IndexError):
+                pass
             try:
                 after_seq = max(0, int(query.get("after_seq", ["0"])[0]))
             except (ValueError, TypeError):
@@ -1165,13 +1286,28 @@ class ClipHouseHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
-        if parsed.path not in ("/api/add", "/api/delete", "/api/favorite"):
+        if parsed.path not in ("/api/add", "/api/delete", "/api/favorite", "/api/replicate"):
             self._json(404, {"ok": False, "error": "Не найдено"})
             return
         try:
             data = self._read_json()
             if not isinstance(data, dict):
                 raise ValueError("Некорректные данные")
+            if parsed.path == "/api/replicate":
+                if int(data.get("version", 0)) != APP_VERSION:
+                    self._json(409, {"ok": False, "error": "Несовместимая версия ClipHouse; обнови все узлы"})
+                    return
+                source_node = str(data.get("node_id", ""))[:100]
+                if not source_node or source_node == NODE_ID:
+                    self._json(400, {"ok": False, "error": "Некорректный отправитель"})
+                    return
+                merged_entries = _merge_events(data.get("entries", []))
+                merged_deletions = _merge_deletions(data.get("deletions", []))
+                merged_favorites = _merge_favorite_events(data.get("favorites", []))
+                self._json(200, {"ok": True, "entries_received": merged_entries,
+                                 "deletions_received": merged_deletions,
+                                 "favorites_received": merged_favorites})
+                return
             if parsed.path == "/api/delete":
                 result = _delete_events(data.get("ids"))
                 self._json(200, {"ok": True, **result})
@@ -1233,7 +1369,7 @@ def main():
 
     ip = _get_lan_ip()
     print("=" * 62)
-    print("ClipHouse %s запущен на компьютере: %s" % (APP_DISPLAY_VERSION, HOST_NAME))
+    print("ClipHouse %s (сетевой протокол %s) запущен на компьютере: %s" % (APP_DISPLAY_VERSION, APP_VERSION, HOST_NAME))
     print("Только на этом ПК: http://127.0.0.1:%s/" % HTTP_PORT)
     print("Для других устройств: http://%s:%s/" % (ip, HTTP_PORT))
     print("Короткое имя после настройки DNS на роутере: http://%s:%s/" % (LOCAL_NAME, HTTP_PORT))
@@ -1242,7 +1378,7 @@ def main():
     print("История: по 50 записей на страницу; SQLite хранит архив")
     print("Избранное: жёлтая звезда; изменения синхронизируются между узлами")
     print("Поиск:              %s" % ("FTS5 (полнотекстовый индекс)" if _FTS_ENABLED else "SQLite LIKE"))
-    print("Автообнаружение:    UDP %s; синхронизация идёт партиями по %s записей" % (DISCOVERY_PORT, SYNC_BATCH_SIZE))
+    print("Синхронизация:       UDP %s; двусторонний PULL + PUSH партиями по %s записей" % (DISCOVERY_PORT, SYNC_BATCH_SIZE))
     print("Настройки:          %s" % CONFIG_PATH)
     print("Оставь это окно запущенным. Ctrl+C в ЭТОМ окне останавливает сервер;")
     print("в других программах Ctrl+C продолжает обычное копирование.")
