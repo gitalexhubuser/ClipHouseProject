@@ -26,4 +26,5 @@
 Ложим сюда `\\HOMEASSISTANT\local_apps\cliphouse`
 
 # Repo
-https://github.com/gitalexhubuser/ClipHouseProject
+
+[https://github.com/gitalexhubuser/ClipHouseProject](https://github.com/gitalexhubuser/ClipHouseProject)
