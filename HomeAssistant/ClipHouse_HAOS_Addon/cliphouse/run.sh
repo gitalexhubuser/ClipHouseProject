@@ -36,6 +36,6 @@ export CLIPHOUSE_CONFIG_PATH="$CONFIG_PATH"
 export CLIPHOUSE_STATE_DIR="$STATE_DIR"
 export PYTHONUNBUFFERED=1
 
-echo "ClipHouse HA app: постоянные данные находятся в ${STATE_DIR}"
+echo "ClipHouse HA app: постоянные данные и файлы находятся в ${STATE_DIR}"
 echo "Открой в домашней сети: http://<IP-Home-Assistant>:8787/"
 exec python3 /app/ClipHouse.py

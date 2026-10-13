@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# ClipHouse — local-network text clipboard with SQLite history.
+# ClipHouse — local-network text clipboard and file exchange with SQLite history.
 # Python standard library only; designed for trusted home networks.
 
 import configparser
@@ -18,8 +18,8 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 APP_NAME = "ClipHouse"
-APP_VERSION = 5
-APP_DISPLAY_VERSION = "4.2.0"
+APP_VERSION = 6
+APP_DISPLAY_VERSION = "4.3.0"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # Optional paths let the same program run in a persistent Home Assistant app container.
 CONFIG_PATH = os.path.abspath(os.environ.get("CLIPHOUSE_CONFIG_PATH", os.path.join(BASE_DIR, "config.ini")))
@@ -28,7 +28,7 @@ APP_STATE_DIR = os.path.abspath(os.environ.get(
     os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), APP_NAME),
 ))
 NODE_PATH = os.path.join(APP_STATE_DIR, "node-id.txt")
-MAX_REQUEST_BYTES = 16 * 1024 * 1024
+MAX_REQUEST_BYTES = 55 * 1024 * 1024  # Increased to allow up to 50 MB files
 PAGE_SIZE = 50
 SYNC_BATCH_SIZE = 25
 POLL_SECONDS = 2.5
@@ -97,7 +97,6 @@ def _read_config():
     raw_history_dir = cfg.get("storage", "history_dir", fallback=default_data_dir)
     history_dir = _expand_path(raw_history_dir, default_data_dir)
     local_name = cfg.get("web", "local_name", fallback="clipboard").strip().strip(".")
-    # Only use a hostname-like label, not a URL/path. The router DNS record is configured separately.
     if not local_name or len(local_name) > 253 or not re.fullmatch(r"[A-Za-z0-9.-]+", local_name) or ".." in local_name:
         local_name = "clipboard"
     return {
@@ -116,6 +115,7 @@ DISCOVERY_PORT = _SETTINGS["discovery_port"]
 DATA_DIR = _SETTINGS["history_dir"]
 DATABASE_PATH = os.path.join(DATA_DIR, "history.sqlite3")
 LEGACY_JSON_PATH = os.path.join(DATA_DIR, "history.json")
+FILES_DIR = None
 AUTO_CAPTURE_CLIPBOARD = _SETTINGS["auto_capture"]
 MAX_TEXT_CHARS = _SETTINGS["max_text_chars"]
 LOCAL_NAME = _SETTINGS["local_name"]
@@ -124,9 +124,9 @@ _db = None
 _db_lock = threading.RLock()
 _clip_lock = threading.Lock()
 _peers_lock = threading.RLock()
-_peers = {}  # node_id -> {url, name, ip, last_seen}
-_sync_error_log = {}  # node_id -> last monotonic timestamp when an error was printed
-_suppressed_clipboard = {}  # exact clipboard text -> monotonic expiry
+_peers = {}
+_sync_error_log = {}
+_suppressed_clipboard = {}
 _http_server = None
 _FTS_ENABLED = False
 
@@ -136,7 +136,6 @@ def _ensure_state_dir():
 
 
 def _load_node_id():
-    # Node identity remains stable even if the database is moved to another disk.
     _ensure_state_dir()
     try:
         with open(NODE_PATH, "r", encoding="utf-8") as f:
@@ -187,14 +186,13 @@ def _event_from_row(row):
         "node": row["node"],
         "source": row["source"],
     }
-    # History queries include a left-joined favorite state; sync/latest queries may not.
     if "favorite" in row.keys():
         result["favorite"] = bool(row["favorite"])
     return result
 
 
 def _initialize_database():
-    global _db, _FTS_ENABLED, DATA_DIR, DATABASE_PATH, LEGACY_JSON_PATH
+    global _db, _FTS_ENABLED, DATA_DIR, DATABASE_PATH, LEGACY_JSON_PATH, FILES_DIR
     try:
         os.makedirs(DATA_DIR, exist_ok=True)
     except OSError as exc:
@@ -205,6 +203,9 @@ def _initialize_database():
         DATABASE_PATH = os.path.join(DATA_DIR, "history.sqlite3")
         LEGACY_JSON_PATH = os.path.join(DATA_DIR, "history.json")
         os.makedirs(DATA_DIR, exist_ok=True)
+
+    FILES_DIR = os.path.join(DATA_DIR, "files")
+    os.makedirs(FILES_DIR, exist_ok=True)
 
     _db = sqlite3.connect(DATABASE_PATH, timeout=30, check_same_thread=False)
     _db.row_factory = sqlite3.Row
@@ -230,8 +231,6 @@ def _initialize_database():
             node TEXT NOT NULL DEFAULT ''
         )""")
         _db.execute("CREATE INDEX IF NOT EXISTS idx_deletions_time ON deletions(deleted_ts DESC, seq DESC)")
-        # Favorite state is kept separately from clipboard text. The event log lets
-        # every node forward star/unstar changes to its other peers.
         _db.execute("""CREATE TABLE IF NOT EXISTS favorite_state (
             entry_id TEXT PRIMARY KEY,
             is_favorite INTEGER NOT NULL,
@@ -261,7 +260,7 @@ def _initialize_database():
             last_push_delete_seq INTEGER NOT NULL DEFAULT 0,
             last_push_favorite_seq INTEGER NOT NULL DEFAULT 0
         )""")
-        # Upgrade databases from older ClipHouse versions without discarding cursors.
+        
         cursor_columns = {row[1] for row in _db.execute("PRAGMA table_info(sync_cursors)").fetchall()}
         if "last_delete_seq" not in cursor_columns:
             _db.execute("ALTER TABLE sync_cursors ADD COLUMN last_delete_seq INTEGER NOT NULL DEFAULT 0")
@@ -273,8 +272,7 @@ def _initialize_database():
             _db.execute("ALTER TABLE sync_cursors ADD COLUMN last_push_delete_seq INTEGER NOT NULL DEFAULT 0")
         if "last_push_favorite_seq" not in cursor_columns:
             _db.execute("ALTER TABLE sync_cursors ADD COLUMN last_push_favorite_seq INTEGER NOT NULL DEFAULT 0")
-        # Cache the row count so the home page does not scan a giant history table
-        # every 2.5 seconds just to display the count.
+            
         has_count = _db.execute("SELECT 1 FROM meta WHERE key='entries_count'").fetchone()
         if not has_count:
             initial_count = int(_db.execute("SELECT COUNT(*) FROM entries").fetchone()[0])
@@ -287,8 +285,6 @@ def _initialize_database():
         END""")
         _db.commit()
 
-        # FTS5 makes word/phrase search fast. If this Python build lacks FTS5,
-        # ClipHouse automatically falls back to SQLite LIKE search.
         existing_fts = _db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='entries_fts'").fetchone()
         try:
             _db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(text, content='entries', content_rowid='seq')")
@@ -307,37 +303,6 @@ def _initialize_database():
             print("[ClipHouse] FTS5 недоступен: поиск будет работать в обычном режиме.")
             _db.rollback()
 
-        migrated = _db.execute("SELECT value FROM meta WHERE key='legacy_json_migrated'").fetchone()
-        if not migrated:
-            # Also check the old default folder. This lets a user choose a new
-            # history_dir in config.ini before the very first SQLite launch.
-            legacy_candidates = [LEGACY_JSON_PATH, os.path.join(APP_STATE_DIR, "history.json")]
-            legacy_path = next((p for p in legacy_candidates if os.path.isfile(p)), None)
-            if legacy_path:
-                try:
-                    with open(legacy_path, "r", encoding="utf-8") as f:
-                        old_data = json.load(f)
-                    imported = 0
-                    if isinstance(old_data, list):
-                        with _db:
-                            for raw in old_data:
-                                event = _clean_event(raw)
-                                if not event:
-                                    continue
-                                cur = _db.execute(
-                                    "INSERT OR IGNORE INTO entries(id,ts,text,device,node,source) VALUES(?,?,?,?,?,?)",
-                                    (event["id"], event["ts"], event["text"], event["device"], event["node"], event["source"]),
-                                )
-                                imported += cur.rowcount
-                    print("[ClipHouse] Перенесено из %s: %s записей." % (legacy_path, imported))
-                    print("[ClipHouse] Исходный JSON сохранён как резервная копия, он не удалён.")
-                except (OSError, ValueError, TypeError, sqlite3.Error) as exc:
-                    print("[ClipHouse] Не удалось импортировать history.json: %s" % exc)
-                    # Do not set the migration marker so it can retry after the issue is fixed.
-                    return
-            with _db:
-                _db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('legacy_json_migrated','1')")
-
 
 def _get_latest_locked():
     row = _db.execute("SELECT id,ts,text,device,node,source FROM entries ORDER BY ts DESC, seq DESC LIMIT 1").fetchone()
@@ -355,7 +320,6 @@ def _entry_count_locked():
 
 
 def _insert_event_locked(event):
-    # A permanent tombstone wins over an older copy arriving from an offline peer.
     deleted = _db.execute("SELECT 1 FROM deletions WHERE id=?", (event["id"],)).fetchone()
     if deleted:
         return False
@@ -385,7 +349,6 @@ def _clean_deletion(raw):
 
 
 def _merge_deletions(incoming):
-    """Apply replicated tombstones. Tombstones are retained so old records cannot reappear."""
     if not isinstance(incoming, list):
         return 0
     changed = 0
@@ -399,7 +362,6 @@ def _merge_deletions(incoming):
                 (deletion["id"], deletion["deleted_ts"], deletion["device"], deletion["node"]),
             )
             changed += max(0, cur.rowcount)
-            # Remove even if the tombstone already existed; this also repairs a stale reinsert.
             _db.execute("DELETE FROM entries WHERE id=?", (deletion["id"],))
             _db.execute("DELETE FROM favorite_state WHERE entry_id=?", (deletion["id"],))
     if changed:
@@ -408,7 +370,6 @@ def _merge_deletions(incoming):
 
 
 def _delete_events(ids):
-    """Delete records locally and create sync tombstones for every supplied ID."""
     if not isinstance(ids, list):
         raise ValueError("Ожидался список ID записей")
     unique_ids = []
@@ -437,7 +398,6 @@ def _delete_events(ids):
 
 
 def _set_favorite(entry_id, is_favorite):
-    """Set favorite state locally and append a sync event. Returns new state."""
     if not isinstance(entry_id, str) or not entry_id or len(entry_id) > 100:
         raise ValueError("Некорректный ID записи")
     if not isinstance(is_favorite, bool):
@@ -449,8 +409,6 @@ def _set_favorite(entry_id, is_favorite):
         if _db.execute("SELECT 1 FROM deletions WHERE id=?", (entry_id,)).fetchone():
             raise ValueError("Запись уже удалена")
         current = _db.execute("SELECT changed_ts FROM favorite_state WHERE entry_id=?", (entry_id,)).fetchone()
-        # Ensure an explicit local click wins even if another node's clock is ahead
-        # by a small amount; the change timestamp remains monotonic per entry.
         changed_ts = max(int(time.time() * 1000), (int(current[0]) + 1) if current else 0)
         event = {
             "event_id": event_id,
@@ -500,7 +458,6 @@ def _clean_favorite_event(raw):
 
 
 def _merge_favorite_events(incoming):
-    """Merge and relay star/unstar events with deterministic last-write-wins state."""
     if not isinstance(incoming, list):
         return 0
     changed = 0
@@ -515,7 +472,6 @@ def _merge_favorite_events(incoming):
             )
             if not cur.rowcount:
                 continue
-            # A deletion tombstone always wins over any star-state event.
             if _db.execute("SELECT 1 FROM deletions WHERE id=?", (event["entry_id"],)).fetchone():
                 continue
             current = _db.execute(
@@ -567,7 +523,7 @@ def _add_event(text, set_clipboard=False, source="local"):
     if set_clipboard:
         _set_system_clipboard(text)
     if not duplicate:
-        print("[ClipHouse] Новый текст: %s символов (%s)" % (len(text), source))
+        print("[ClipHouse] Новая запись: %s симв. (%s)" % (len(text), source))
     return event, duplicate
 
 
@@ -608,7 +564,6 @@ def _history_page(page=1, query=""):
                 (PAGE_SIZE, offset),
             ).fetchall()
         elif _FTS_ENABLED:
-            # Quoted FTS phrase; malformed/unsupported input falls back to LIKE.
             fts_query = '"' + query.replace('"', '""') + '"'
             try:
                 total = int(_db.execute("SELECT COUNT(*) FROM entries_fts WHERE entries_fts MATCH ?", (fts_query,)).fetchone()[0])
@@ -764,7 +719,6 @@ def _get_favorite_sync_batch(after_seq):
              "device": row["device"], "node": row["node"], "sync_seq": int(row["seq"])} for row in rows]
 
 
-# ---------- Native Windows clipboard (ctypes only; no pywin32 needed) ----------
 _CF_UNICODETEXT = 13
 _GMEM_MOVEABLE = 0x0002
 
@@ -814,6 +768,8 @@ def _read_system_clipboard():
 def _set_system_clipboard(text):
     if os.name != "nt" or not isinstance(text, str) or len(text) > MAX_TEXT_CHARS:
         return False
+    if text.startswith("FILE:"):
+        return False
     user32 = ctypes.windll.user32
     kernel32 = ctypes.windll.kernel32
     user32.OpenClipboard.argtypes = [ctypes.c_void_p]
@@ -855,7 +811,7 @@ def _set_system_clipboard(text):
             kernel32.GlobalFree(hmem)
             hmem = None
             return False
-        hmem = None  # ownership passes to Windows
+        hmem = None
         with _clip_lock:
             _suppressed_clipboard[text] = time.monotonic() + 8.0
         return True
@@ -907,13 +863,7 @@ def _clipboard_watcher():
                 print("[ClipHouse] Ошибка захвата буфера:", exc)
 
 
-# ---------- Peer discovery and incremental replication on LAN ----------
 def _register_peer(peer_id, ip, port, name):
-    """Remember a LAN peer learned from UDP discovery or an HTTP sync request.
-
-    Learning the caller during /api/sync makes discovery resilient when one PC's
-    Windows Firewall drops UDP broadcasts in only one direction.
-    """
     try:
         peer_id = str(peer_id or "").strip()[:100]
         port = int(port)
@@ -923,8 +873,6 @@ def _register_peer(peer_id, ip, port, name):
         return False
     if not peer_id or peer_id == NODE_ID or not ip or not (1 <= port <= 65535):
         return False
-    # The IP address comes from recvfrom() or the TCP socket peer address, not from
-    # a value supplied by the remote request. Do not allow URL/path injection.
     if any(ch not in "0123456789." for ch in ip):
         return False
     with _peers_lock:
@@ -962,7 +910,6 @@ def _discovery_receiver():
             if (info.get("app") != APP_NAME or int(info.get("version", 0)) != APP_VERSION
                     or not info.get("id") or info.get("id") == NODE_ID):
                 continue
-            # New database protocol; update all computers to the same project version.
             port = int(info.get("port", HTTP_PORT))
             if not 1 <= port <= 65535:
                 continue
@@ -987,7 +934,6 @@ def _peer_sync_loop():
             peers = [(pid, dict(peer)) for pid, peer in _peers.items()]
         for peer_id, peer in peers:
             try:
-                # PULL: retrieve changes published by this peer.
                 cursor = _get_sync_cursor(peer_id)
                 delete_cursor = _get_sync_delete_cursor(peer_id)
                 favorite_cursor = _get_sync_favorite_cursor(peer_id)
@@ -1001,7 +947,7 @@ def _peer_sync_loop():
                     "from_version": APP_VERSION,
                 })
                 url = peer["url"] + "/api/sync?" + sync_query
-                req = urllib.request.Request(url, headers={"User-Agent": "ClipHouse/4.1"})
+                req = urllib.request.Request(url, headers={"User-Agent": "ClipHouse/4.3"})
                 with urllib.request.urlopen(req, timeout=3.0) as response:
                     payload = json.loads(response.read(32 * 1024 * 1024).decode("utf-8"))
                 if payload.get("node_id") == NODE_ID or int(payload.get("version", 0)) != APP_VERSION:
@@ -1020,10 +966,6 @@ def _peer_sync_loop():
                 if next_favorite_cursor > favorite_cursor:
                     _set_sync_favorite_cursor(peer_id, next_favorite_cursor)
 
-                # PUSH: send our own/unseen changes to the peer too. This is important
-                # when UDP discovery is asymmetric: A can see B and connect to B, while
-                # B may not receive A's UDP broadcast. A can still send changes to B over
-                # the same working HTTP connection direction.
                 push_cursor = _get_push_cursor(peer_id, "last_push_seq")
                 push_delete_cursor = _get_push_cursor(peer_id, "last_push_delete_seq")
                 push_favorite_cursor = _get_push_cursor(peer_id, "last_push_favorite_seq")
@@ -1041,7 +983,7 @@ def _peer_sync_loop():
                     push_body = json.dumps(push_payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
                     push_req = urllib.request.Request(
                         peer["url"] + "/api/replicate", data=push_body,
-                        headers={"Content-Type": "application/json", "User-Agent": "ClipHouse/4.1"},
+                        headers={"Content-Type": "application/json", "User-Agent": "ClipHouse/4.3"},
                         method="POST",
                     )
                     with urllib.request.urlopen(push_req, timeout=3.0) as response:
@@ -1056,8 +998,6 @@ def _peer_sync_loop():
                         _set_push_cursor(peer_id, "last_push_favorite_seq", push_favorites[-1]["sync_seq"])
                 _sync_error_log.pop(peer_id, None)
             except Exception as exc:
-                # A peer may be sleeping, rebooting, or blocked by firewall. Log
-                # occasionally so one-way connectivity can be diagnosed without flooding.
                 last_log = _sync_error_log.get(peer_id, 0.0)
                 if time.monotonic() - last_log >= 15.0:
                     print("[ClipHouse] Синхронизация с %s (%s) не удалась: %s" %
@@ -1068,7 +1008,7 @@ def _peer_sync_loop():
 def _get_lan_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        s.connect(("192.0.2.1", 9))  # route lookup only; sends no packet
+        s.connect(("192.0.2.1", 9))
         ip = s.getsockname()[0]
         if not ip.startswith("127."):
             return ip
@@ -1098,8 +1038,10 @@ HTML_PAGE = r'''<!doctype html>
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
 </style></head><body><main>
 <div class="top"><div class="brand">📋 ClipHouse</div><div class="record-count" id="recordCount">Записей: —</div></div>
-<section class="panel"><label for="newtext">Добавить текст</label><textarea id="newtext" placeholder="Вставь или напиши текст…" maxlength="1000000"></textarea><div class="actions"><button class="primary" id="publish">Добавить</button><button id="clearbox">Очистить</button></div></section>
-<section class="panel"><div class="latest-title"><span>Последний текст</span><button class="icon-btn copy-btn" id="copylatest" title="Копировать последний текст" aria-label="Копировать последний текст" style="display:none"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="13" height="13" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/></svg></button></div><pre id="latest" class="entry-text">Пока пусто.</pre></section>
+<section class="panel"><label for="newtext">Добавить текст или файл</label><textarea id="newtext" placeholder="Вставь или напиши текст…" maxlength="1000000"></textarea>
+<div class="actions"><button class="primary" id="publish">Добавить</button><button id="uploadBtn" type="button" title="Прикрепить файл">📎 Файл</button><input type="file" id="fileInput" style="display:none"><button id="clearbox">Очистить</button></div>
+</section>
+<section class="panel"><div class="latest-title"><span>Последнее событие</span><button class="icon-btn copy-btn" id="copylatest" title="Копировать последний текст" aria-label="Копировать последний текст" style="display:none"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="13" height="13" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/></svg></button></div><div id="latest" class="entry-text" style="white-space:pre-wrap;">Пока пусто.</div></section>
 <section class="panel favorite-panel"><details id="favoritesDetails"><summary class="history-head"><span class="favorite-summary-star">★</span> Избранное <span class="favorite-count" id="favoriteCount"></span></summary><div class="history-info"><span id="favoritePageLabel"></span><span></span></div><div id="favorites"><div class="empty">Загрузи избранное, нажав на заголовок.</div></div><div class="pager"><button id="prevFavorites" disabled>← Назад</button><button id="nextFavorites" disabled>Дальше →</button></div></details></section>
 <section class="panel"><details id="historyDetails"><summary class="history-head">История</summary><div class="search-row"><input id="search" type="search" placeholder="Поиск" aria-label="Поиск"><button id="searchButton" class="search-button" title="Найти" aria-label="Найти"><svg class="small-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.8" cy="10.8" r="6.8"/><path d="m16 16 5 5"/></svg></button><button id="clearSearch" class="clear-search" title="Очистить поиск" aria-label="Очистить поиск"><svg class="small-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button></div><div class="history-info"><span id="resultCount">Последние записи</span><span id="pageLabel"></span></div><div id="history"><div class="empty">Нажми, чтобы загрузить последние записи.</div></div><div class="pager"><button id="prevPage" disabled>← Новее</button><button id="nextPage" disabled>Старее →</button></div></details></section>
 </main><div class="toast" id="toast" role="status" aria-live="polite"></div>
@@ -1119,7 +1061,15 @@ function renderEntries(data,rootId,favoritesMode=false){
  root.innerHTML=entries.map((e,i)=>{
   const dt=new Date(e.ts);const when=dt.toLocaleDateString([],{day:'2-digit',month:'2-digit',year:'numeric'})+' '+dt.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
   const starred=!!e.favorite;const num=pageBase+i+1;
-  return '<article class="entry '+(starred?'favorite-entry':'')+'"><span class="entry-number">'+num+'</span><div class="entry-content"><div class="entry-bar"><span class="entry-time">'+esc(when)+'</span><span class="entry-charcount">'+String(e.text.length)+' симв.</span><div class="entry-actions"><button class="icon-btn star-toggle '+(starred?'active':'')+'" data-favorite="'+i+'" title="'+(starred?'Убрать из избранного':'Добавить в избранное')+'" aria-label="'+(starred?'Убрать из избранного':'Добавить в избранное')+'">'+(starred?'★':'☆')+'</button><button class="icon-btn copy-btn" data-copy="'+i+'" title="Копировать" aria-label="Копировать">'+COPY_ICON+'</button><button class="icon-btn delete-btn" data-delete="'+i+'" title="Удалить везде" aria-label="Удалить везде">'+DELETE_ICON+'</button></div></div><pre class="entry-text">'+esc(e.text)+'</pre></div></article>'
+  let textHtml='';let copyBtn='';
+  if(e.text.startsWith('FILE:')){
+    const diskName=e.text.substring(5);const origName=diskName.split('_').slice(1).join('_');
+    textHtml=`<div class="entry-text" style="background:#1b2028;border:1px dashed #4c7dc0;text-align:center;padding:15px;"><div style="font-size:24px;margin-bottom:5px;">📁</div><div style="font-weight:bold;word-break:break-all;">${esc(origName)}</div><a href="/api/download/${encodeURIComponent(diskName)}" target="_blank" style="display:inline-block;margin-top:10px;padding:6px 12px;background:#315f9e;border-radius:6px;color:white;text-decoration:none;">Скачать файл</a></div>`;
+  }else{
+    textHtml=`<pre class="entry-text">${esc(e.text)}</pre>`;
+    copyBtn=`<button class="icon-btn copy-btn" data-copy="${i}" title="Копировать" aria-label="Копировать">${COPY_ICON}</button>`;
+  }
+  return '<article class="entry '+(starred?'favorite-entry':'')+'"><span class="entry-number">'+num+'</span><div class="entry-content"><div class="entry-bar"><span class="entry-time">'+esc(when)+'</span><span class="entry-charcount">'+(e.text.startsWith('FILE:')?'Файл':String(e.text.length)+' симв.')+'</span><div class="entry-actions"><button class="icon-btn star-toggle '+(starred?'active':'')+'" data-favorite="'+i+'" title="'+(starred?'Убрать из избранного':'Добавить в избранное')+'" aria-label="'+(starred?'Убрать из избранного':'Добавить в избранное')+'">'+(starred?'★':'☆')+'</button>'+copyBtn+'<button class="icon-btn delete-btn" data-delete="'+i+'" title="Удалить везде" aria-label="Удалить везде">'+DELETE_ICON+'</button></div></div>'+textHtml+'</div></article>'
  }).join('');
  root.querySelectorAll('[data-copy]').forEach(btn=>btn.addEventListener('click',async()=>{const e=entries[Number(btn.dataset.copy)];if(e){await copyText(e.text);btn.classList.add('copied');setTimeout(()=>btn.classList.remove('copied'),700)}}));
  root.querySelectorAll('[data-favorite]').forEach(btn=>btn.addEventListener('click',async()=>{const entry=entries[Number(btn.dataset.favorite)];if(!entry)return;btn.disabled=true;try{const r=await fetch('/api/favorite',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:entry.id,favorite:!entry.favorite})});const d=await r.json();if(!r.ok||!d.ok)throw new Error(d.error||'Ошибка избранного');toast(d.favorite?'В избранном ★':'Убрано из избранного');if($('historyDetails').open&&historyLoaded)await loadHistory(currentPage,currentQuery);if($('favoritesDetails').open||favoritesLoaded)await loadFavorites(favoritesPage);await loadState()}catch(err){toast(err.message);btn.disabled=false}}));
@@ -1129,20 +1079,25 @@ function renderHistory(data){pageCount=data.pages||1;currentPage=data.page||1;$(
 function renderFavorites(data){favoritesPage=data.page||1;favoritesPages=data.pages||1;$('favoriteCount').textContent='('+Number(data.total||0)+')';$('favoritePageLabel').textContent=data.pages>1?'Стр. '+favoritesPage+'/'+favoritesPages:'';$('prevFavorites').disabled=!data.has_prev;$('nextFavorites').disabled=!data.has_next;renderEntries(data,'favorites',true);favoritesLoaded=true}
 async function loadFavorites(page=1){const token=++favoritesRequestToken;favoritesPage=page;try{const r=await fetch('/api/favorites?page='+page,{cache:'no-store'});const d=await r.json();if(token!==favoritesRequestToken)return;if(!r.ok||!d.ok)throw new Error(d.error||'Ошибка загрузки избранного');if(page>(d.pages||1))return loadFavorites(d.pages||1);renderFavorites(d)}catch(e){$('favorites').innerHTML='<div class="empty">Не удалось загрузить избранное: '+esc(e.message)+'</div>'}}
 async function loadHistory(page=1,query=currentQuery){const token=++requestToken;currentPage=page;currentQuery=query;const params=new URLSearchParams({page:String(page),q:query});try{const r=await fetch('/api/history?'+params.toString(),{cache:'no-store'});const d=await r.json();if(token!==requestToken)return;if(!r.ok||!d.ok)throw new Error(d.error||'Ошибка загрузки истории');renderHistory(d);historyLoaded=true}catch(e){$('history').innerHTML='<div class="empty">Ошибка загрузки: '+esc(e.message)+'</div>'}}
-async function loadState(){try{const r=await fetch('/api/state',{cache:'no-store'});const d=await r.json();if(!r.ok||!d.ok)return;const total=Number(d.total||0);$('recordCount').textContent=pluralRecords(total);const latest=d.latest||null;const latestId=latest?latest.id:'';const totalChanged=knownTotal!==null&&knownTotal!==total;const latestChanged=knownTopId!==null&&knownTopId!==latestId;const favRevision=Number(d.favorite_revision||0);const favoriteChanged=knownFavoriteRevision!==null&&favRevision!==knownFavoriteRevision;knownTotal=total;knownTopId=latestId;knownFavoriteRevision=favRevision;if(latest){knownTop=latest.text;if($('latest').textContent!==latest.text)$('latest').textContent=latest.text;$('copylatest').style.display='inline-flex'}else{knownTop='';$('latest').textContent='Пока пусто.';$('copylatest').style.display='none'}if((totalChanged||latestChanged)&&$('historyDetails').open&&historyLoaded)await loadHistory(currentPage,currentQuery);if(favoriteChanged&&$('favoritesDetails').open&&favoritesLoaded)await loadFavorites(favoritesPage)}catch(e){/* transient local-network failure: retry next cycle without replacing the page */}}
+async function loadState(){try{const r=await fetch('/api/state',{cache:'no-store'});const d=await r.json();if(!r.ok||!d.ok)return;const total=Number(d.total||0);$('recordCount').textContent=pluralRecords(total);const latest=d.latest||null;const latestId=latest?latest.id:'';const totalChanged=knownTotal!==null&&knownTotal!==total;const latestChanged=knownTopId!==null&&knownTopId!==latestId;const favRevision=Number(d.favorite_revision||0);const favoriteChanged=knownFavoriteRevision!==null&&favRevision!==knownFavoriteRevision;knownTotal=total;knownTopId=latestId;knownFavoriteRevision=favRevision;if(latest){knownTop=latest.text;if(latest.text.startsWith('FILE:')){const diskName=latest.text.substring(5);const origName=diskName.split('_').slice(1).join('_');$('latest').innerHTML=`<div style="text-align:center;padding:10px;">📁 <b>${esc(origName)}</b><br><a href="/api/download/${encodeURIComponent(diskName)}" target="_blank" style="color:var(--accent);">Скачать файл</a></div>`;$('copylatest').style.display='none';}else{if($('latest').innerHTML!==esc(latest.text))$('latest').innerHTML=esc(latest.text);$('copylatest').style.display='inline-flex';}}else{knownTop='';$('latest').innerHTML='Пока пусто.';$('copylatest').style.display='none'}if((totalChanged||latestChanged)&&$('historyDetails').open&&historyLoaded)await loadHistory(currentPage,currentQuery);if(favoriteChanged&&$('favoritesDetails').open&&favoritesLoaded)await loadFavorites(favoritesPage)}catch(e){}}
 function scheduleStatePoll(){clearTimeout(stateTimer);stateTimer=setTimeout(async()=>{await loadState();scheduleStatePoll()},5000)}
-$('publish').addEventListener('click',async()=>{const text=$('newtext').value;if(!text.trim()){toast('Введи текст');return}const b=$('publish');b.disabled=true;try{await postText(text);$('newtext').value='';toast('Добавлено');await loadState();if($('historyDetails').open)await loadHistory(1,currentQuery)}catch(e){toast(e.message)}finally{b.disabled=false}});
-$('clearbox').addEventListener('click',()=>$('newtext').value='');$('copylatest').addEventListener('click',()=>copyText(knownTop));
+$('publish').addEventListener('click',async()=>{const text=$('newtext').value;if(!text.trim()){toast('Введи текст');return}const b=$('publish');b.disabled=true;try{await postText(text);$('newtext').value='';toast('Добавлено');await loadState();if($('historyDetails').open)await loadHistory(1,currentQuery)}catch(e){toast(e.message)}finally{b.disabled=false}});$('clearbox').addEventListener('click',()=>$('newtext').value='');$('copylatest').addEventListener('click',()=>copyText(knownTop));
 $('historyDetails').addEventListener('toggle',()=>{if($('historyDetails').open)loadHistory(1,currentQuery)});
-$('searchButton').addEventListener('click',()=>loadHistory(1,$('search').value.trim()));$('search').addEventListener('keydown',e=>{if(e.key==='Enter')loadHistory(1,$('search').value.trim())});$('clearSearch').addEventListener('click',()=>{$('search').value='';loadHistory(1,'');$('search').blur()});
-$('prevPage').addEventListener('click',()=>{if(currentPage>1)loadHistory(currentPage-1,currentQuery)});$('nextPage').addEventListener('click',()=>{if(currentPage<pageCount)loadHistory(currentPage+1,currentQuery)});
-$('favoritesDetails').addEventListener('toggle',()=>{if($('favoritesDetails').open)loadFavorites(favoritesPage)});$('prevFavorites').addEventListener('click',()=>{if(favoritesPage>1)loadFavorites(favoritesPage-1)});$('nextFavorites').addEventListener('click',()=>{if(favoritesPage<favoritesPages)loadFavorites(favoritesPage+1)});
+$('searchButton').addEventListener('click',()=>loadHistory(1,$('search').value.trim()));$('search').addEventListener('keydown',e=>{if(e.key==='Enter')loadHistory(1,$('search').value.trim())});$('clearSearch').addEventListener('click',()=>{$('search').value='';loadHistory(1,'');$('search').blur()});$('prevPage').addEventListener('click',()=>{if(currentPage>1)loadHistory(currentPage-1,currentQuery)});$('nextPage').addEventListener('click',()=>{if(currentPage<pageCount)loadHistory(currentPage+1,currentQuery)});$('favoritesDetails').addEventListener('toggle',()=>{if($('favoritesDetails').open)loadFavorites(favoritesPage)});$('prevFavorites').addEventListener('click',()=>{if(favoritesPage>1)loadFavorites(favoritesPage-1)});$('nextFavorites').addEventListener('click',()=>{if(favoritesPage<favoritesPages)loadFavorites(favoritesPage+1)});$('uploadBtn').addEventListener('click',()=>$('fileInput').click());$('fileInput').addEventListener('change',async(e)=>{
+  const file=e.target.files[0];if(!file)return;
+  const b=$('uploadBtn');b.disabled=true;toast('Загрузка...');
+  try{
+    const r=await fetch('/api/upload',{method:'POST',headers:{'X-File-Name':encodeURIComponent(file.name),'Content-Type':'application/octet-stream'},body:file});
+    const d=await r.json();if(!r.ok||!d.ok)throw new Error(d.error||'Ошибка загрузки');
+    toast('Файл загружен');$('fileInput').value='';await loadState();if($('historyDetails').open)await loadHistory(1,currentQuery);
+  }catch(err){toast('Ошибка: '+err.message)}finally{b.disabled=false}
+});
 loadState().then(scheduleStatePoll);
 </script></body></html>'''
 
 
 class ClipHouseHandler(BaseHTTPRequestHandler):
-    server_version = "ClipHouse/4.2.0"
+    server_version = "ClipHouse/4.3.0"
 
     def log_message(self, fmt, *args):
         return
@@ -1171,7 +1126,7 @@ class ClipHouseHandler(BaseHTTPRequestHandler):
         except ValueError:
             raise ValueError("Некорректный размер запроса")
         if length < 1 or length > MAX_REQUEST_BYTES:
-            raise ValueError("Размер запроса должен быть от 1 байта до 5 МБ")
+            raise ValueError("Размер запроса должен быть от 1 байта до 50 МБ")
         raw = self.rfile.read(length)
         try:
             return json.loads(raw.decode("utf-8"))
@@ -1195,6 +1150,25 @@ class ClipHouseHandler(BaseHTTPRequestHandler):
             self._json(200, {"ok": True, "node_id": NODE_ID, "host": HOST_NAME, "peer_count": len(peer_names),
                              "peers": peer_names, "latest": latest, "total": total,
                              "favorite_revision": favorite_revision})
+            return
+        if parsed.path.startswith("/api/download/"):
+            filename = urllib.parse.unquote(parsed.path.split("/")[-1])
+            safe_name = os.path.basename(filename)
+            file_path = os.path.join(FILES_DIR, safe_name)
+            if os.path.isfile(file_path):
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                dl_name = safe_name.split("_", 1)[-1] if "_" in safe_name else safe_name
+                self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{urllib.parse.quote(dl_name)}")
+                self.send_header("Content-Length", str(os.path.getsize(file_path)))
+                self.end_headers()
+                try:
+                    with open(file_path, "rb") as f:
+                        self.wfile.write(f.read())
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                return
+            self._json(404, {"ok": False, "error": "Файл не найден"})
             return
         if parsed.path == "/api/history":
             query = urllib.parse.parse_qs(parsed.query)
@@ -1221,9 +1195,6 @@ class ClipHouseHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/sync":
             query = urllib.parse.parse_qs(parsed.query)
-            # A successful sync request is also a reliable way to learn the caller.
-            # It repairs asymmetric UDP discovery: if A sees B but B misses A's
-            # broadcast, B learns A from this HTTP request and begins pulling back.
             try:
                 caller_version = int(query.get("from_version", ["0"])[0])
                 caller_id = query.get("from_id", [""])[0]
@@ -1264,9 +1235,31 @@ class ClipHouseHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
-        if parsed.path not in ("/api/add", "/api/delete", "/api/favorite", "/api/replicate"):
+        if parsed.path not in ("/api/add", "/api/delete", "/api/favorite", "/api/replicate", "/api/upload"):
             self._json(404, {"ok": False, "error": "Не найдено"})
             return
+            
+        if parsed.path == "/api/upload":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if length > 50 * 1024 * 1024:
+                    self._json(413, {"ok": False, "error": "Файл больше 50 МБ"})
+                    return
+                file_name = urllib.parse.unquote(self.headers.get("X-File-Name", "file.dat"))
+                file_data = self.rfile.read(length)
+                file_id = str(uuid.uuid4())[:8]
+                safe_name = re.sub(r'[\\/*?:"<>|]', "", file_name)
+                disk_name = f"{file_id}_{safe_name}"
+                
+                with open(os.path.join(FILES_DIR, disk_name), "wb") as f:
+                    f.write(file_data)
+                
+                event, duplicate = _add_event(f"FILE:{disk_name}", set_clipboard=False, source="web")
+                self._json(200, {"ok": True, "id": event["id"]})
+            except Exception as exc:
+                self._json(500, {"ok": False, "error": str(exc)})
+            return
+            
         try:
             data = self._read_json()
             if not isinstance(data, dict):
@@ -1352,15 +1345,10 @@ def main():
     print("Для других устройств: http://%s:%s/" % (ip, HTTP_PORT))
     print("Короткое имя после настройки DNS на роутере: http://%s:%s/" % (LOCAL_NAME, HTTP_PORT))
     print("SQLite:             %s" % DATABASE_PATH)
+    print("Файлы:              %s" % FILES_DIR)
     print("Автозахват буфера:  %s" % ("ВКЛ" if AUTO_CAPTURE_CLIPBOARD else "ВЫКЛ (текст добавляется через сайт)"))
-    print("История: по 50 записей на страницу; SQLite хранит архив")
-    print("Избранное: жёлтая звезда; изменения синхронизируются между узлами")
-    print("Поиск:              %s" % ("FTS5 (полнотекстовый индекс)" if _FTS_ENABLED else "SQLite LIKE"))
-    print("Синхронизация:       UDP %s; двусторонний PULL + PUSH партиями по %s записей" % (DISCOVERY_PORT, SYNC_BATCH_SIZE))
+    print("Синхронизация:      UDP %s; двусторонний PULL + PUSH партиями по %s записей" % (DISCOVERY_PORT, SYNC_BATCH_SIZE))
     print("Настройки:          %s" % CONFIG_PATH)
-    print("Оставь это окно запущенным. Ctrl+C в ЭТОМ окне останавливает сервер;")
-    print("в других программах Ctrl+C продолжает обычное копирование.")
-    print("Не открывай порты ClipHouse в интернет на роутере.")
     print("=" * 62)
     try:
         while True:
@@ -1374,6 +1362,6 @@ def main():
             with _db_lock:
                 _db.close()
 
-
 if __name__ == "__main__":
     main()
+    
